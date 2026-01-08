@@ -164,6 +164,7 @@ Examples:
         sw_events=sw_events,
         annotation_manager=annotation_manager,
         focus_channels=args.channels,
+        chanlocs=eeg_data_obj.chanlocs,  # Pass channel locations for topoplots
     )
     
     # Wrap in a servable template

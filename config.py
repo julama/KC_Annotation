@@ -11,7 +11,7 @@ SW_FILTER_LOW = 0.5  # Hz
 SW_FILTER_HIGH = 2.0  # Hz
 
 # Default sleep stages to analyze
-DEFAULT_SLEEP_STAGES = [1, 0, -1, -2, -3]
+DEFAULT_SLEEP_STAGES = [-2]#[1, 0, -1, -2, -3]
 
 # Sampling rate (will be read from data, but default fallback)
 DEFAULT_SAMPLING_RATE = 125.0  # Hz
