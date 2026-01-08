@@ -1,5 +1,3 @@
-"""Main Panel Dashboard for EEG Annotation"""
-
 import panel as pn
 import holoviews as hv
 from holoviews import opts, streams
@@ -7,466 +5,244 @@ import param
 import numpy as np
 import pandas as pd
 from typing import Optional, List
-from bokeh.models import HoverTool
 
 # Initialize extensions
 pn.extension('tabulator', sizing_mode='stretch_width')
 hv.extension('bokeh')
 
-# Color mapping for annotation states
+# --- CONFIGURATION ---
 ANNOTATION_COLORS = {
-    'unannotated': '#7f8c8d',  # Gray
+    'unannotated': '#95a5a6',  # Gray
     'KC': '#27ae60',           # Green  
     'non-KC': '#c0392b',       # Red
 }
 
-
-def downsample_minmax(data: np.ndarray, time: np.ndarray, 
-                      max_points: int = 4000) -> tuple:
-    """
-    Downsample preserving min/max for EEG visualization.
-    """
-    n_samples = len(data)
-    if n_samples <= max_points:
-        return time, data
-    
-    # Min-max downsampling preserves peaks
-    step = max(1, n_samples // (max_points // 2))
-    indices = []
-    for i in range(0, n_samples - step, step):
+def downsample_minmax(data: np.ndarray, time: np.ndarray, max_points: int = 4000) -> tuple:
+    n = len(data)
+    if n <= max_points: return time, data
+    step = max(1, n // (max_points // 2))
+    idx = []
+    for i in range(0, n - step, step):
         chunk = data[i:i+step]
-        min_idx = i + np.argmin(chunk)
-        max_idx = i + np.argmax(chunk)
-        if min_idx <= max_idx:
-            indices.extend([min_idx, max_idx])
-        else:
-            indices.extend([max_idx, min_idx])
-    
-    indices = sorted(set(indices))
-    if len(indices) == 0:
-        return time, data
-    return time[indices], data[indices]
+        idx.extend([i + np.argmin(chunk), i + np.argmax(chunk)])
+    idx = sorted(set(idx))
+    return time[idx], data[idx]
 
+# --- KEYBOARD LISTENER COMPONENT ---
+class KeyboardListener(pn.reactive.ReactiveHTML):
+    """
+    Native Panel component that listens to document-level keydown events.
+    Invisible but active.
+    """
+    key = param.String(default="")
+    _template = '<div id="kb-listener" style="width:0; height:0; overflow:hidden"></div>'
+    _scripts = {
+        'render': """
+            // Remove previous listener if exists
+            if (window.kb_handler) document.removeEventListener('keydown', window.kb_handler);
+            
+            // Define new handler
+            window.kb_handler = (e) => {
+                // Ignore if user is typing in a real text input
+                if (e.target.matches('input, textarea')) return;
+                
+                let k = e.key.toLowerCase();
+                // Sync specific keys to Python (KC: k/c, non-KC: n/x, unannotated: u/y)
+                if (['k', 'c', 'n', 'x', 'u', 'y'].includes(k)) { 
+                    data.key = k; 
+                }
+            };
+            
+            // Attach to document
+            document.addEventListener('keydown', window.kb_handler);
+        """
+    }
 
+# --- DASHBOARD CLASS ---
 class EEGDashboard(param.Parameterized):
-    """
-    Panel-based EEG Dashboard with HoloViews visualization.
-    
-    Features:
-    - Multi-channel overlay with subcoordinate_y
-    - Focus channel individual rows
-    - Linked x-axes for synchronized zooming/panning
-    - SW event VSpans with click-to-annotate
-    - Navigation buttons
-    """
-    
-    # Reactive parameters
-    epoch_index = param.Integer(default=0, bounds=(0, None), doc="Current epoch index")
-    update_trigger = param.Integer(default=0, doc="Trigger for annotation updates")
+    # Reactive Params
+    epoch_index = param.Integer(default=0, bounds=(0, None))
+    selected_event_id = param.Integer(default=-1)
+    current_label = param.Selector(objects=['KC', 'non-KC', 'unannotated'], default='unannotated')
+    update_trigger = param.Integer(default=0)
     
     def __init__(self, epoch_manager, sw_events: pd.DataFrame,
-                 annotation_manager, focus_channels: List[int] = None,
-                 **params):
-        super().__init__(**params)
+                 annotation_manager, focus_channels: List[int] = None, **params):
         
+        # --- FIX: Set attributes BEFORE super().__init__ ---
+        # This prevents "AttributeError" if watchers fire during init
         self.epoch_manager = epoch_manager
         self.sw_events = sw_events
         self.annotation_manager = annotation_manager
-        self.sampling_rate = epoch_manager.sampling_rate
         self.focus_channels = focus_channels or [34, 55, 70]
+        self.sampling_rate = epoch_manager.sampling_rate
         
-        # Update epoch bounds
-        max_epochs = max(0, epoch_manager.get_epoch_count() - 1)
-        self.param.epoch_index.bounds = (0, max_epochs)
+        # Now call super, which might trigger watchers immediately
+        super().__init__(**params)
         
-        # Shared x-range for linking (will be connected via Bokeh)
-        self._x_range = None
+        self.param.epoch_index.bounds = (0, max(0, epoch_manager.get_epoch_count() - 1))
         
-        # Cache current epoch data
-        self._current_epoch_data = None
-        self._current_sw_events = None
-    
+        # Initialize Interaction Streams
+        self.tap_stream = streams.Tap(transient=True)
+        self.tap_stream.add_subscriber(self._on_plot_click)
+
+        # Initialize Keyboard Listener
+        self.kb_listener = KeyboardListener()
+        self.kb_listener.param.watch(self._handle_kb_event, 'key')
+
     def _get_epoch_data(self):
-        """Get current epoch data and SW events (with caching)."""
-        # Sync epoch manager
         self.epoch_manager.current_epoch_idx = self.epoch_index
-        
-        # Get data
-        self._current_epoch_data = self.epoch_manager.get_current_epoch()
-        
-        # Filter SW events for this epoch
+        epoch_data = self.epoch_manager.get_current_epoch()
+        # Ensure this import path matches your project structure
         from src.sw_loader import get_sw_events_for_current_epoch
-        self._current_sw_events = get_sw_events_for_current_epoch(
-            self.sw_events, self.epoch_manager
-        )
-        
-        return self._current_epoch_data, self._current_sw_events
+        return epoch_data, get_sw_events_for_current_epoch(self.sw_events, self.epoch_manager)
     
-    def _create_time_axis(self, n_samples: int) -> np.ndarray:
-        """Create time axis in seconds."""
-        return np.arange(n_samples) / self.sampling_rate
-    
-    def _create_sw_vspans(self, sw_events: pd.DataFrame, alpha: float = 0.25) -> hv.Overlay:
-        """Create VSpan elements for SW events."""
-        if sw_events.empty:
-            return hv.Overlay([])
-        
-        vspans = []
-        for _, sw_row in sw_events.iterrows():
-            event_id = sw_row['event_id']
-            
-            rel_start = sw_row.get('relative_start', 0)
-            rel_stop = sw_row.get('relative_stop', 0)
-            
-            start_time = rel_start / self.sampling_rate
-            stop_time = rel_stop / self.sampling_rate
-            
-            status = self.annotation_manager.get_annotation_status(event_id)
-            color = ANNOTATION_COLORS.get(status, ANNOTATION_COLORS['unannotated'])
-            
-            vspan = hv.VSpan(start_time, stop_time).opts(
-                color=color,
-                alpha=alpha,
-                line_width=1,
-                line_color=color,
-                line_alpha=0.6,
-            )
-            vspans.append(vspan)
-        
-        return hv.Overlay(vspans) if vspans else hv.Overlay([])
-    
-    @param.depends('epoch_index', 'update_trigger')
-    def create_main_plot(self) -> hv.Overlay:
-        """
-        Create main overlay plot with all channels using vertical offset stacking.
-        
-        Compatible with HoloViews 1.17.x (uses manual offset instead of subcoordinate_y).
-        """
-        epoch_data, current_sw = self._get_epoch_data()
-        
-        if epoch_data is None or epoch_data.empty:
-            return hv.Text(0, 0, "No data available").opts(
-                width=1200, height=400
-            )
-        
-        n_samples = len(epoch_data)
-        time_axis = self._create_time_axis(n_samples)
-        n_channels = len(epoch_data.columns)
-        
-        # Select channels for display (limit to ~20 for performance)
-        if n_channels > 20:
-            step = n_channels // 16
-            display_indices = list(range(0, n_channels, step))[:20]
-        else:
-            display_indices = list(range(n_channels))
-        
-        # Calculate vertical spacing for channel stacking
-        # Normalize each channel and apply offset
-        curves = []
-        y_offset = 0
-        channel_spacing = 100  # Spacing between channels in normalized units
-        
-        colors = ['#3498db', '#e74c3c', '#2ecc71', '#9b59b6', '#f39c12', 
-                  '#1abc9c', '#e91e63', '#00bcd4', '#ff5722', '#607d8b'] * 3
-        
-        for i, idx in enumerate(display_indices):
-            ch_data = epoch_data.iloc[:, idx].values
-            
-            # Normalize to ~[-50, 50] range and apply offset
-            ch_std = np.std(ch_data)
-            if ch_std > 0:
-                normalized = (ch_data - np.mean(ch_data)) / ch_std * 30
-            else:
-                normalized = ch_data - np.mean(ch_data)
-            
-            offset_data = normalized + y_offset
-            t_disp, d_disp = downsample_minmax(offset_data, time_axis)
-            
-            curve = hv.Curve(
-                (t_disp, d_disp),
-                kdims=['Time (s)'],
-                vdims=['Amplitude'],
-                label=f'Ch{idx}'
-            ).opts(
-                line_width=1,
-                color=colors[i % len(colors)],
-            )
-            curves.append(curve)
-            
-            # Update offset for next channel
-            y_offset += channel_spacing
-        
-        # Create channel overlay
-        channel_overlay = hv.Overlay(curves)
-        
-        # Add SW event VSpans
-        sw_overlay = self._create_sw_vspans(current_sw, alpha=0.2)
-        
-        # Combine
-        combined = sw_overlay * channel_overlay
-        
-        # Get epoch info for title
-        epoch_info = self.epoch_manager.get_current_epoch_info()
-        sleep_stage = epoch_info.get('sleep_stage', '?')
-        total_epochs = epoch_info.get('total_filtered', 0)
-        
-        combined.opts(
-            opts.Overlay(
-                width=1200,
-                height=500,
-                title=f"Epoch {self.epoch_index + 1}/{total_epochs} | Sleep Stage: {sleep_stage}",
-                xlabel='Time (s)',
-                ylabel='Channels (stacked)',
-                tools=['xwheel_zoom', 'xpan', 'reset', 'tap'],
-                active_tools=['xwheel_zoom', 'xpan'],
-                shared_axes=True,
-                show_legend=False,  # Too cluttered with many channels
-            ),
-            opts.VSpan(
-                apply_ranges=False,  # Don't affect y-axis range
-            )
-        )
-        
-        return combined
-    
-    @param.depends('epoch_index', 'update_trigger')
-    def create_focus_plot(self, channel_idx: int) -> hv.Overlay:
-        """Create individual focus channel plot."""
-        epoch_data, current_sw = self._get_epoch_data()
-        
-        if epoch_data is None or epoch_data.empty:
-            return hv.Text(0, 0, f"No data").opts(width=1200, height=150)
-        
-        if channel_idx >= len(epoch_data.columns):
-            return hv.Text(0, 0, f"Channel {channel_idx} not found").opts(
-                width=1200, height=150
-            )
-        
-        n_samples = len(epoch_data)
-        time_axis = self._create_time_axis(n_samples)
-        
-        ch_data = epoch_data.iloc[:, channel_idx].values
-        t_disp, d_disp = downsample_minmax(ch_data, time_axis)
-        
-        # Create main curve
-        curve = hv.Curve(
-            (t_disp, d_disp),
-            kdims=['Time (s)'],
-            vdims=['Amplitude (µV)'],
-        )
-        
-        # Add SW VSpans
-        sw_overlay = self._create_sw_vspans(current_sw, alpha=0.3)
-        
-        combined = sw_overlay * curve
-        
-        combined.opts(
-            opts.Curve(
-                line_width=1.5,
-                color='#34495e',
-                tools=['xwheel_zoom', 'xpan', 'reset', 'tap', 'hover'],
-                active_tools=['xwheel_zoom', 'xpan'],
-            ),
-            opts.Overlay(
-                width=1200,
-                height=150,
-                title=f"Channel {channel_idx}",
-                xlabel='Time (s)',
-                ylabel='µV',
-                shared_axes=True,
-            ),
-            opts.VSpan(
-                apply_ranges=False,
-            )
-        )
-        
-        return combined
-    
-    def next_epoch(self, event=None):
-        """Navigate to next epoch."""
-        max_idx = self.epoch_manager.get_epoch_count() - 1
-        if self.epoch_index < max_idx:
-            self.epoch_index += 1
-    
-    def prev_epoch(self, event=None):
-        """Navigate to previous epoch."""
-        if self.epoch_index > 0:
-            self.epoch_index -= 1
-    
-    def _get_status_text(self) -> str:
-        """Get status bar text."""
-        epoch_info = self.epoch_manager.get_current_epoch_info()
-        counts = self.annotation_manager.get_annotation_count()
-        
-        return (
-            f"**Epoch**: {self.epoch_index + 1} / {epoch_info.get('total_filtered', 0)} | "
-            f"**Sleep Stage**: {epoch_info.get('sleep_stage', '?')} | "
-            f"**KC**: {counts['KC']} | **non-KC**: {counts['non-KC']} | "
-            f"**Unannotated**: {counts['unannotated']}"
-        )
-    
-    @param.depends('epoch_index', 'update_trigger')
-    def status_bar(self) -> pn.pane.Markdown:
-        """Create reactive status bar."""
-        return pn.pane.Markdown(
-            self._get_status_text(),
-            styles={'font-size': '14px', 'padding': '10px', 'background': '#ecf0f1'}
-        )
-    
-    def create_sw_buttons(self) -> pn.Column:
-        """Create annotation buttons for SW events in current epoch."""
+    def _create_time_axis(self, n): return np.arange(n) / self.sampling_rate
+
+    # --- INTERACTION LOGIC ---
+    def _on_plot_click(self, x, y):
+        """Handle clicks on the plot (select event)."""
+        if x is None: return
         _, current_sw = self._get_epoch_data()
+        if current_sw is None or current_sw.empty: return
+
+        starts = current_sw['relative_start'] / self.sampling_rate
+        stops = current_sw['relative_stop'] / self.sampling_rate
+        mask = (starts <= x) & (stops >= x)
         
-        if current_sw.empty:
-            return pn.Column(
-                pn.pane.Markdown("*No SW events in this epoch*"),
-                sizing_mode='stretch_width'
-            )
+        if mask.any():
+            eid = current_sw[mask].iloc[0]['event_id']
+            print(f"🎯 Clicked: {eid}")
+            self.selected_event_id = int(eid)
+            
+            # Sync label
+            status = self.annotation_manager.get_annotation_status(eid)
+            self.current_label = status if status in ['KC', 'non-KC'] else 'unannotated'
+            
+            self.update_trigger += 1
+
+    def _handle_kb_event(self, event):
+        """Handle keyboard input from the ReactiveHTML component."""
+        key = event.new
+        if not key or self.selected_event_id == -1: return
         
-        buttons = []
-        # Limit to first 30 events for UI
-        for _, sw_row in current_sw.head(30).iterrows():
-            event_id = sw_row['event_id']
-            status = self.annotation_manager.get_annotation_status(event_id)
-            
-            # Button styling based on status
-            if status == 'KC':
-                button_type = 'success'
-                label = f'SW {event_id}: KC'
-            elif status == 'non-KC':
-                button_type = 'danger'
-                label = f'SW {event_id}: non-KC'
-            else:
-                button_type = 'default'
-                label = f'SW {event_id}: ?'
-            
-            btn = pn.widgets.Button(
-                name=label,
-                button_type=button_type,
-                width=120,
-                height=35,
-            )
-            
-            # Bind click handler
-            def on_click(event, eid=event_id):
-                self.annotation_manager.toggle_annotation(eid)
-                self.update_trigger += 1  # Trigger refresh
-            
-            btn.on_click(on_click)
-            buttons.append(btn)
+        print(f"⌨️ Key Press: {key}")
         
-        if len(current_sw) > 30:
-            buttons.append(
-                pn.pane.Markdown(f"*(Showing 30 of {len(current_sw)} events)*")
-            )
+        # Map keys to labels (JavaScript already converts to lowercase)
+        if key in ['k', 'c']:
+            self.current_label = 'KC'
+        elif key in ['n', 'x']:
+            self.current_label = 'non-KC'
+        elif key in ['u', 'y']:
+            self.current_label = 'unannotated'
         
-        return pn.FlexBox(*buttons, flex_wrap='wrap', align_items='flex-start')
-    
+        # Reset listener so repeated keys work
+        self.kb_listener.key = ""
+
+    @param.depends('current_label', watch=True)
+    def _on_label_change(self):
+        """Update annotation when label changes (via Key or UI)."""
+        if self.selected_event_id == -1: return
+        
+        if self.current_label == 'KC':
+            self.annotation_manager.set_annotation(self.selected_event_id, True)
+        elif self.current_label == 'non-KC':
+            self.annotation_manager.set_annotation(self.selected_event_id, False)
+        else:
+            if self.selected_event_id in self.annotation_manager.annotations:
+                del self.annotation_manager.annotations[self.selected_event_id]
+                self.annotation_manager._save_annotations()
+        
+        self.update_trigger += 1
+
+    # --- PLOTTING ---
+    def _create_sw_rects(self, sw_events, y_range):
+        if sw_events.empty: return hv.Rectangles([], kdims=['x0', 'y0', 'x1', 'y1'])
+        y_min, y_max = y_range
+        rect_data = []
+        for _, row in sw_events.iterrows():
+            eid = row['event_id']
+            status = self.annotation_manager.get_annotation_status(eid)
+            is_sel = (eid == self.selected_event_id)
+            
+            fill = ANNOTATION_COLORS.get(status, ANNOTATION_COLORS['unannotated'])
+            lc = '#f1c40f' if is_sel else fill
+            lw = 4 if is_sel else 1
+            alpha = 0.6 if is_sel else 0.3
+            
+            rect_data.append({'x0': row['relative_start']/self.sampling_rate, 'y0': y_min,
+                              'x1': row['relative_stop']/self.sampling_rate, 'y1': y_max,
+                              'event_id': eid, 'status': status, 'fill_color': fill, 
+                              'line_color': lc, 'line_width': lw, 'alpha': alpha})
+        
+        return hv.Rectangles(pd.DataFrame(rect_data), kdims=['x0','y0','x1','y1'], 
+                             vdims=['event_id','status','fill_color','line_color','line_width','alpha']).opts(
+            color='fill_color', line_color='line_color', line_width='line_width', alpha='alpha', tools=['hover', 'tap'])
+
     @param.depends('epoch_index', 'update_trigger')
-    def sw_buttons_view(self):
-        """Reactive SW buttons panel."""
-        return self.create_sw_buttons()
-    
+    def create_main_plot(self, **kwargs): # kwargs handles x,y from Tap stream
+        epoch_data, current_sw = self._get_epoch_data()
+        if epoch_data is None: return hv.Spacer()
+        
+        t = self._create_time_axis(len(epoch_data))
+        curves = []
+        y_off = 0
+        for col in epoch_data.columns[:20]:
+            d = epoch_data[col].values
+            d = (d - np.mean(d)) / (np.std(d) or 1) * 30 + y_off
+            tt, dd = downsample_minmax(d, t)
+            curves.append(hv.Curve((tt, dd)).opts(color='black', line_width=1))
+            y_off += 100
+            
+        combined = hv.Overlay(curves) * self._create_sw_rects(current_sw, (-50, y_off+50))
+        return combined.opts(opts.Overlay(width=1200, height=500, shared_axes=True, show_legend=False, 
+                         tools=['tap', 'hover', 'xwheel_zoom', 'xpan'], active_tools=['tap', 'xwheel_zoom']))
+
+    @param.depends('epoch_index', 'update_trigger')
+    def create_focus_plot(self, channel_idx):
+        epoch_data, current_sw = self._get_epoch_data()
+        if epoch_data is None: return hv.Spacer()
+        d = epoch_data.iloc[:, channel_idx].values
+        t = self._create_time_axis(len(d))
+        tt, dd = downsample_minmax(d, t)
+        curve = hv.Curve((tt, dd)).opts(color='#34495e', line_width=1.5)
+        rects = self._create_sw_rects(current_sw, (np.min(dd)*1.1, np.max(dd)*1.1))
+        return (curve * rects).opts(opts.Overlay(width=1200, height=150, shared_axes=True, xaxis=None, ylabel=f"Ch {channel_idx}"))
+
     def view(self) -> pn.Column:
-        """Create the complete dashboard layout."""
+        btn_prev = pn.widgets.Button(name='◀ Prev', width=80)
+        btn_next = pn.widgets.Button(name='Next ▶', width=80)
+        btn_prev.on_click(lambda e: setattr(self, 'epoch_index', max(0, self.epoch_index - 1)))
+        btn_next.on_click(lambda e: setattr(self, 'epoch_index', self.epoch_index + 1))
         
-        # Navigation buttons
-        prev_btn = pn.widgets.Button(
-            name='◀ Previous', 
-            button_type='primary',
-            width=120,
+        # Radio Buttons
+        radio_group = pn.widgets.RadioButtonGroup(
+            name='Annotation', options=['KC', 'non-KC', 'unannotated'], 
+            button_type='default', value=self.current_label
         )
-        prev_btn.on_click(self.prev_epoch)
-        
-        next_btn = pn.widgets.Button(
-            name='Next ▶',
-            button_type='primary', 
-            width=120,
-        )
-        next_btn.on_click(self.next_epoch)
-        
-        # Epoch slider for quick navigation
-        epoch_slider = pn.widgets.IntSlider.from_param(
-            self.param.epoch_index,
-            name='Epoch',
-            width=400,
-        )
-        
-        # Navigation row
-        nav_row = pn.Row(
-            prev_btn,
-            pn.Spacer(width=20),
-            epoch_slider,
-            pn.Spacer(width=20),
-            next_btn,
-            align='center',
-        )
-        
-        # Create linked plots using DynamicMap for reactivity
-        main_dmap = hv.DynamicMap(self.create_main_plot)
-        
-        # Focus channel plots
-        focus_dmaps = []
-        for ch_idx in self.focus_channels:
-            dmap = hv.DynamicMap(
-                lambda idx=ch_idx: self.create_focus_plot(idx)
-            )
-            focus_dmaps.append(dmap)
-        
-        # Stack all plots with shared axes
-        all_plots = [main_dmap] + focus_dmaps
-        
-        # Create a linked layout using HoloViews
-        # Note: We'll use Panel's Column for layout since we want shared x-axes
-        plot_layout = pn.Column(
-            pn.pane.HoloViews(main_dmap, linked_axes=True, sizing_mode='stretch_width'),
-            *[pn.pane.HoloViews(dmap, linked_axes=True, sizing_mode='stretch_width') 
-              for dmap in focus_dmaps],
-            sizing_mode='stretch_width',
-        )
-        
-        # Full dashboard layout
-        dashboard = pn.Column(
-            pn.pane.Markdown(
-                "# 🧠 EEG K-Complex Annotation Tool",
-                styles={'text-align': 'center'}
-            ),
-            self.status_bar,
-            pn.layout.Divider(),
-            nav_row,
-            pn.layout.Divider(),
-            pn.pane.Markdown("### SW Event Annotations"),
-            pn.pane.Markdown("*Click buttons to cycle: Unknown → KC → non-KC → Unknown*"),
-            self.sw_buttons_view,
-            pn.layout.Divider(),
-            pn.pane.Markdown("### EEG Signals"),
-            plot_layout,
-            sizing_mode='stretch_width',
-        )
-        
-        return dashboard
+        self.param.watch(lambda e: setattr(radio_group, 'value', e.new), 'current_label')
+        radio_group.param.watch(lambda e: setattr(self, 'current_label', e.new), 'value')
 
+        info = pn.bind(lambda eid: pn.pane.Markdown(f"### 🎯 Selected Event: {eid}" if eid != -1 else "### No Event Selected"), eid=self.param.selected_event_id)
 
-def create_dashboard(epoch_manager, sw_events: pd.DataFrame,
-                    annotation_manager, focus_channels: List[int] = None) -> pn.Column:
-    """
-    Factory function to create the EEG dashboard.
-    
-    Args:
-        epoch_manager: EpochManager instance
-        sw_events: DataFrame with SW events
-        annotation_manager: AnnotationManager instance
-        focus_channels: List of channel indices for focus rows
+        style = pn.pane.HTML("""<style>
+        .bk-btn-group .bk-btn:nth-child(1) { background-color: #27ae60 !important; color: white !important; }
+        .bk-btn-group .bk-btn:nth-child(2) { background-color: #c0392b !important; color: white !important; }
+        .bk-btn-group .bk-btn:nth-child(3) { background-color: #95a5a6 !important; color: white !important; }
+        </style>""")
+
+        main_dmap = hv.DynamicMap(self.create_main_plot, streams=[self.tap_stream])
+        focus_col = pn.Column(*[hv.DynamicMap(lambda idx=ch: self.create_focus_plot(idx)) for ch in self.focus_channels])
         
-    Returns:
-        Panel Column layout
-    """
-    dashboard = EEGDashboard(
-        epoch_manager=epoch_manager,
-        sw_events=sw_events,
-        annotation_manager=annotation_manager,
-        focus_channels=focus_channels,
-    )
-    
-    return dashboard.view()
+        return pn.Column(
+            pn.Row(btn_prev, btn_next, pn.Spacer(width=30), pn.Column(info, radio_group, pn.pane.Markdown("**Keys:** `K`/`C` = KC, `N`/`X` = non-KC, `U`/`Y` = unannotated")), align='center'),
+            pn.pane.HoloViews(main_dmap),
+            focus_col,
+            self.kb_listener,  # <--- INVISIBLE LISTENER COMPONENT
+            style,
+            sizing_mode='stretch_width'
+        )
 
+def create_dashboard(epoch_manager, sw_events, annotation_manager, focus_channels=None):
+    db = EEGDashboard(epoch_manager, sw_events, annotation_manager, focus_channels)
+    return db.view()
