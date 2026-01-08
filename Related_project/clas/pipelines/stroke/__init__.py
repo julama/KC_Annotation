@@ -1,0 +1,3 @@
+"""
+Stroke study-specific pipelines
+"""
