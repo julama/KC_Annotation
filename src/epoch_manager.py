@@ -44,6 +44,11 @@ class EpochManager:
         # Current epoch index (in filtered list)
         self.current_epoch_idx = 0
         
+        # Epoch cache for performance optimization
+        self._epoch_cache = {}  # Maps filtered_idx -> DataFrame
+        self._cache_range = 4  # Number of epochs to cache on each side
+        self._cached_center_idx = -1  # Center epoch index for current cache
+        
         print(f"Total epochs: {len(self.epochs_df)}")
         print(f"Filtered epochs (stages {self.sleep_stages}): {len(self.filtered_epochs_df)}")
     
@@ -89,16 +94,61 @@ class EpochManager:
         
         return filtered
     
+    def _load_epochs_into_cache(self, center_filtered_idx: int):
+        """Load epochs around center_idx into cache (±cache_range epochs)."""
+        if len(self.filtered_epochs_df) == 0:
+            return
+        
+        # Calculate cache range
+        cache_start = max(0, center_filtered_idx - self._cache_range)
+        cache_end = min(len(self.filtered_epochs_df), center_filtered_idx + self._cache_range + 1)
+        
+        # Clear cache if we're jumping too far (beyond cache range)
+        if (self._cached_center_idx != -1 and 
+            abs(center_filtered_idx - self._cached_center_idx) > self._cache_range * 2):
+            self._epoch_cache.clear()
+        
+        # Load epochs into cache
+        for idx in range(cache_start, cache_end):
+            if idx not in self._epoch_cache:
+                epoch_info = self.filtered_epochs_df.iloc[idx]
+                start_idx = int(epoch_info['start_idx'])
+                end_idx = int(epoch_info['end_idx']) + 1  # +1 for inclusive end
+                
+                # Load epoch data and cache it
+                epoch_data = self.eeg_data.iloc[start_idx:end_idx].copy()
+                self._epoch_cache[idx] = epoch_data
+        
+        # Update cached center
+        self._cached_center_idx = center_filtered_idx
+        
+        # Trim cache if it gets too large (keep only ±cache_range from center)
+        if len(self._epoch_cache) > (self._cache_range * 2 + 1) * 2:  # Allow some buffer
+            keys_to_remove = [k for k in self._epoch_cache.keys() 
+                            if abs(k - center_filtered_idx) > self._cache_range * 2]
+            for k in keys_to_remove:
+                del self._epoch_cache[k]
+    
     def get_current_epoch(self) -> pd.DataFrame:
-        """Get EEG data for current epoch"""
+        """Get EEG data for current epoch (uses cache if available)."""
         if len(self.filtered_epochs_df) == 0:
             return pd.DataFrame()
         
+        # Check cache first
+        if self.current_epoch_idx in self._epoch_cache:
+            return self._epoch_cache[self.current_epoch_idx]
+        
+        # Cache miss - load into cache and return
+        self._load_epochs_into_cache(self.current_epoch_idx)
+        
+        # Should now be in cache
+        if self.current_epoch_idx in self._epoch_cache:
+            return self._epoch_cache[self.current_epoch_idx]
+        
+        # Fallback (shouldn't happen, but safety check)
         epoch_info = self.filtered_epochs_df.iloc[self.current_epoch_idx]
-        # Ensure indices are integers (pandas iloc requires int)
         start_idx = int(epoch_info['start_idx'])
         end_idx = int(epoch_info['end_idx']) + 1  # +1 for inclusive end
-        
         return self.eeg_data.iloc[start_idx:end_idx].copy()
     
     def get_current_epoch_info(self) -> dict:
@@ -115,6 +165,8 @@ class EpochManager:
         """Move to next epoch. Returns True if successful, False if at end"""
         if self.current_epoch_idx < len(self.filtered_epochs_df) - 1:
             self.current_epoch_idx += 1
+            # Preload cache for new position
+            self._load_epochs_into_cache(self.current_epoch_idx)
             return True
         return False
     
@@ -122,6 +174,8 @@ class EpochManager:
         """Move to previous epoch. Returns True if successful, False if at start"""
         if self.current_epoch_idx > 0:
             self.current_epoch_idx -= 1
+            # Preload cache for new position
+            self._load_epochs_into_cache(self.current_epoch_idx)
             return True
         return False
     
@@ -129,6 +183,8 @@ class EpochManager:
         """Go to specific epoch by filtered index. Returns True if successful"""
         if 0 <= filtered_idx < len(self.filtered_epochs_df):
             self.current_epoch_idx = filtered_idx
+            # Preload cache for new position
+            self._load_epochs_into_cache(self.current_epoch_idx)
             return True
         return False
     

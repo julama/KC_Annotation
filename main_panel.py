@@ -4,9 +4,6 @@ Main entry point for Panel-based EEG K-Complex Annotation Tool.
 
 Usage:
     python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
-    
-Or with SW events CSV:
-    python main_panel.py --mat-file <path.mat> --sw-csv <path.csv>
 """
 
 import argparse
@@ -20,7 +17,6 @@ import panel as pn
 from src.data_loader import load_mat_file
 from src.preprocessing import preprocess_eeg
 from src.epoch_manager import EpochManager
-from src.sw_loader import load_sw_events
 from src.annotation_manager import AnnotationManager
 from src.panel_app.dashboard import create_dashboard
 import config
@@ -34,12 +30,11 @@ def main():
         epilog="""
 Examples:
     python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
-    python main_panel.py --mat-file data.mat --sw-csv sw_events.csv --channels 34 55 70
+    python main_panel.py --mat-file data.mat --channels 34 55 70
     python main_panel.py --mat-file data.mat --port 5007
         """
     )
     parser.add_argument('--mat-file', type=str, help='Path to .mat file')
-    parser.add_argument('--sw-csv', type=str, help='Path to SW events CSV file')
     parser.add_argument('--annotation-file', type=str, default='annotations.csv',
                        help='Path to annotation output file (default: annotations.csv)')
     parser.add_argument('--sleep-stages', type=int, nargs='+',
@@ -92,28 +87,6 @@ Examples:
         print(f"Error: .mat file not found: {mat_file}")
         sys.exit(1)
     
-    # SW events CSV
-    if args.sw_csv:
-        sw_csv = Path(args.sw_csv)
-    else:
-        # Try to find SW CSV with common naming patterns
-        possible_sw_files = [
-            mat_file.parent.parent / f"{mat_file.stem.replace('_EEG_FiltDwn_05to30Hz', '')}_sw_events.csv",
-            mat_file.parent / f"{mat_file.stem}_sw_events.csv",
-            Path("Data") / f"{mat_file.stem.replace('_EEG_FiltDwn_05to30Hz', '')}_sw_events.csv",
-        ]
-        
-        sw_csv = None
-        for possible_path in possible_sw_files:
-            if possible_path.exists():
-                sw_csv = possible_path
-                print(f"Found SW events CSV: {sw_csv}")
-                break
-        
-        if sw_csv is None:
-            print(f"Warning: SW events CSV not found.")
-            print("  You can create one with columns: start_idx, stop_idx")
-    
     # Load .mat file
     print(f"\n{'='*60}")
     print(f"Loading .mat file: {mat_file}")
@@ -140,31 +113,36 @@ Examples:
         sleep_stages=args.sleep_stages
     )
     
-    # Load SW events
-    print("\nLoading SW events...")
-    if sw_csv and sw_csv.exists():
-        sw_events = load_sw_events(str(sw_csv))
-    else:
-        print("  No SW events CSV found. Creating empty DataFrame.")
-        sw_events = pd.DataFrame(columns=['start_idx', 'stop_idx', 'event_id'])
-    
-    # Create annotation manager
+    # Create annotation manager (no longer needs SW events)
     annotation_file = args.annotation_file
     if not Path(annotation_file).is_absolute():
         # Save in same directory as .mat file
         annotation_file = str(mat_file.parent / annotation_file)
     
     print(f"\nInitializing annotation manager (output: {annotation_file})...")
-    annotation_manager = AnnotationManager(sw_events, annotation_file)
+    annotation_manager = AnnotationManager(annotation_file, epoch_manager.sampling_rate)
+    
+    # Find channels.csv file
+    channels_file = None
+    possible_channels_files = [
+        mat_file.parent / "channels.csv",
+        mat_file.parent.parent / "channels.csv",
+        Path("Data/channels.csv"),
+    ]
+    for path in possible_channels_files:
+        if path.exists():
+            channels_file = str(path)
+            print(f"Found channels file: {channels_file}")
+            break
     
     # Create Panel dashboard
     print("\nCreating Panel dashboard...")
     dashboard = create_dashboard(
         epoch_manager=epoch_manager,
-        sw_events=sw_events,
         annotation_manager=annotation_manager,
         focus_channels=args.channels,
         chanlocs=eeg_data_obj.chanlocs,  # Pass channel locations for topoplots
+        channels_file=channels_file,
     )
     
     # Wrap in a servable template

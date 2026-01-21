@@ -1,3 +1,0 @@
-"""
-EPISL study-specific pipelines
-"""

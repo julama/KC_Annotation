@@ -8,7 +8,7 @@ DEFAULT_CHANNEL_INDICES = [34, 55, 70]
 
 # Slow Wave filter parameters
 SW_FILTER_LOW = 0.5  # Hz
-SW_FILTER_HIGH = 2.0  # Hz
+SW_FILTER_HIGH = 35.0  # Hz
 
 # Default sleep stages to analyze
 DEFAULT_SLEEP_STAGES = [-2]#[1, 0, -1, -2, -3]
