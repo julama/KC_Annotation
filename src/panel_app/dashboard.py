@@ -138,14 +138,18 @@ class EEGDashboard(param.Parameterized):
     
     def __init__(self, epoch_manager, annotation_manager, 
                  focus_channels: List[int] = None,
+                 main_plot_channels: List[int] = None,
                  chanlocs: pd.DataFrame = None, 
-                 channels_file: Optional[str] = None, **params):
+                 channels_file: Optional[str] = None,
+                 exclude_channels: List[int] = None, **params):
         
         # --- FIX: Set attributes BEFORE super().__init__ ---
         # This prevents "AttributeError" if watchers fire during init
         self.epoch_manager = epoch_manager
         self.annotation_manager = annotation_manager
         self.focus_channels = focus_channels or [34, 55, 70]
+        self.main_plot_channels = main_plot_channels
+        self.exclude_channels = exclude_channels or []
         self.sampling_rate = epoch_manager.sampling_rate
         self.chanlocs = chanlocs if chanlocs is not None else pd.DataFrame()
         
@@ -178,6 +182,7 @@ class EEGDashboard(param.Parameterized):
         self._cached_curves = None
         self._cached_epoch_index = -1
         self._cached_time_axis = None
+        self._cached_y_range = (-200, 200)
         
         # Cache for epoch_data to avoid redundant calls to _get_epoch_data()
         self._cached_epoch_data = None
@@ -560,9 +565,11 @@ class EEGDashboard(param.Parameterized):
             # Get channel positions
             if not self.chanlocs.empty:
                 if 'X' in self.chanlocs.columns and 'Y' in self.chanlocs.columns:
-                    pos = np.array([self.chanlocs['X'].values, self.chanlocs['Y'].values]).T
+                    # Rotate 90 degrees counter-clockwise: X (Nose) points Up instead of Right
+                    # New X = -Old Y, New Y = Old X
+                    pos = np.array([-self.chanlocs['Y'].values, self.chanlocs['X'].values]).T
                 elif 'x' in self.chanlocs.columns and 'y' in self.chanlocs.columns:
-                    pos = np.array([self.chanlocs['x'].values, self.chanlocs['y'].values]).T
+                    pos = np.array([-self.chanlocs['y'].values, self.chanlocs['x'].values]).T
                 else:
                     # Fallback: create circular layout
                     n_chans = len(mean_data)
@@ -573,6 +580,18 @@ class EEGDashboard(param.Parameterized):
                 n_chans = len(mean_data)
                 angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
                 pos = np.array([np.cos(angles), np.sin(angles)]).T
+            
+            # Filter out excluded channels from topoplot
+            if self.exclude_channels:
+                n_chans = len(mean_data)
+                # Create mask: True for channels to KEEP
+                mask = np.ones(n_chans, dtype=bool)
+                for idx in self.exclude_channels:
+                    if 0 <= idx < n_chans:
+                        mask[idx] = False
+                
+                mean_data = mean_data[mask]
+                pos = pos[mask]
             
             # Create topoplot using MNE
             fig, ax = plt.subplots(figsize=(3, 3))
@@ -838,24 +857,49 @@ class EEGDashboard(param.Parameterized):
             curves = []
             first_curve = None
             
-            # Limit to ~30 channels max to keep UI responsive
-            n_channels = len(epoch_data.columns)
-            target_n_channels = 30
-            if n_channels > target_n_channels:
-                step = max(1, n_channels // target_n_channels)
-                indices = list(range(0, n_channels, step))
-            else:
-                indices = list(range(n_channels))
+            # Track min/max for dynamic scaling
+            y_data_min = 0
+            y_data_max = 0
             
-            for i in indices:
+            # Determine which channels to plot
+            if self.main_plot_channels is not None:
+                # Use configured channels, filtering out any that are out of bounds
+                n_total = len(epoch_data.columns)
+                indices = [i for i in self.main_plot_channels if 0 <= i < n_total]
+                if not indices:
+                    print("Warning: No valid channels in main_plot_channels. Falling back to default.")
+                    indices = list(range(min(30, n_total)))
+            else:
+                # Limit to ~30 channels max to keep UI responsive
+                n_channels = len(epoch_data.columns)
+                target_n_channels = 30
+                if n_channels > target_n_channels:
+                    step = max(1, n_channels // target_n_channels)
+                    indices = list(range(0, n_channels, step))
+                else:
+                    indices = list(range(n_channels))
+            
+            for i_idx, i in enumerate(indices):
                 col = epoch_data.columns[i]
                 d = epoch_data[col].values
                 # Normalize but don't offset (all on same scale)
                 d_normalized = (d - np.mean(d)) / (np.std(d) or 1) * 30
+                
+                # Update min/max
+                current_min = np.min(d_normalized)
+                current_max = np.max(d_normalized)
+                
+                if i_idx == 0:
+                    y_data_min = current_min
+                    y_data_max = current_max
+                else:
+                    y_data_min = min(y_data_min, current_min)
+                    y_data_max = max(y_data_max, current_max)
+                
                 tt, dd = downsample_minmax(d_normalized, t)
                 color = self._get_channel_color(i)
                 
-                if i == indices[0]:
+                if i_idx == 0:
                     # First curve: enable box_select and store reference
                     first_curve = hv.Curve((tt, dd), label=f'Ch {i}').opts(
                         color=color,
@@ -872,13 +916,22 @@ class EEGDashboard(param.Parameterized):
                     )
                     curves.append(curve)
             
+            # Calculate dynamic range with padding and clipping
+            y_pad = (y_data_max - y_data_min) * 0.1
+            if y_pad == 0: y_pad = 10
+            
+            y_limit_min = max(-300, y_data_min - y_pad)
+            y_limit_max = min(300, y_data_max + y_pad)
+            
             # Cache curves and epoch index
             self._cached_curves = curves
             self._cached_epoch_index = self.epoch_index
+            self._cached_y_range = (y_limit_min, y_limit_max)
         else:
             # Reuse cached curves
             curves = self._cached_curves
             first_curve = curves[0] if curves else None
+            y_limit_min, y_limit_max = self._cached_y_range
         
         # Update bounds stream source to first curve for box selection
         # Always update to ensure it's connected to the current plot
@@ -897,8 +950,8 @@ class EEGDashboard(param.Parameterized):
                     self._bounds_stream = streams.BoundsXY(source=first_curve)
                     self._bounds_stream.add_subscriber(self._on_box_select)
         
-        # Fixed y_range for butterfly plot
-        y_range = (-200, 200)
+        # Dynamic y_range for butterfly plot
+        y_range = (y_limit_min, y_limit_max)
         
         t3 = time_module.time()
         # Add region rectangles
@@ -931,12 +984,12 @@ class EEGDashboard(param.Parameterized):
         
         # Set plot options with y_range customization hook
         def set_y_range(plot, element):
-            """Hook to set y-axis range to -200 to +200"""
+            """Hook to set y-axis range dynamically"""
             # Access the y_range directly from handles
             if hasattr(plot, 'handles') and 'y_range' in plot.handles:
-                y_range = plot.handles['y_range']
-                y_range.start = -200
-                y_range.end = 200
+                y_range_handle = plot.handles['y_range']
+                y_range_handle.start = y_limit_min
+                y_range_handle.end = y_limit_max
         
         # Hook to ensure box_select tool is enabled after plot updates
         def ensure_box_select(plot, element):
@@ -977,13 +1030,15 @@ class EEGDashboard(param.Parameterized):
             width=1200, height=500, shared_axes=True, show_legend=False, 
             tools=['tap', 'hover', 'xwheel_zoom', 'xpan','box_select'], 
             active_tools=['tap', 'box_select'],
-            hooks=[set_y_range, ensure_box_select, optimize_selection]
+            hooks=[set_y_range, ensure_box_select, optimize_selection],
+            #ylim=(y_limit_min, y_limit_max),
+            #framewise=True
         )
         
-        return combined.opts(plot_opts)
+        return combined.opts(plot_opts)s
 
     @param.depends('epoch_index', 'focus_plot_trigger')
-    def create_focus_plot(self, channel_idx):
+    def create_focus_plot(self, channel_idx, **kwargs):
         """Create focus channel plot (cached when epoch and selection unchanged)."""
         import time as time_module
         t0 = time_module.time()
@@ -1083,10 +1138,14 @@ class EEGDashboard(param.Parameterized):
         
         # Fix focus plots: use functools.partial or proper lambda to capture channel index
         from functools import partial
+        
+        # Explicitly define streams for focus plots since partial() hides param.depends metadata
+        focus_streams = [hv.streams.Params(self, ['epoch_index', 'focus_plot_trigger'])]
+        
         focus_dmaps = []
         for ch_idx in self.focus_channels:
             # Create a bound method that properly captures the channel index
-            focus_dmap = hv.DynamicMap(partial(self.create_focus_plot, channel_idx=ch_idx))
+            focus_dmap = hv.DynamicMap(partial(self.create_focus_plot, channel_idx=ch_idx), streams=focus_streams)
             focus_dmaps.append(focus_dmap)
         focus_col = pn.Column(*[pn.pane.HoloViews(dmap) for dmap in focus_dmaps])
         
@@ -1124,7 +1183,7 @@ class EEGDashboard(param.Parameterized):
             margin=(0, 10)
         )
 
-def create_dashboard(epoch_manager, annotation_manager, focus_channels=None, chanlocs=None, channels_file=None):
+def create_dashboard(epoch_manager, annotation_manager, focus_channels=None, main_plot_channels=None, chanlocs=None, channels_file=None, exclude_channels=None):
     """Create dashboard instance."""
-    db = EEGDashboard(epoch_manager, annotation_manager, focus_channels, chanlocs, channels_file)
+    db = EEGDashboard(epoch_manager, annotation_manager, focus_channels, main_plot_channels, chanlocs, channels_file, exclude_channels)
     return db.view()

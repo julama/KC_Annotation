@@ -42,7 +42,7 @@ Examples:
                        help=f'Sleep stages to analyze (default: {config.DEFAULT_SLEEP_STAGES})')
     parser.add_argument('--channels', type=int, nargs='+',
                        default=config.DEFAULT_CHANNEL_INDICES,
-                       help=f'Focus channel indices to display (default: {config.DEFAULT_CHANNEL_INDICES})')
+                       help=f'Focus channel indices to display (0-based, default: {config.DEFAULT_CHANNEL_INDICES})')
     parser.add_argument('--reference', type=str, choices=['average', 'common', 'none'],
                        default=None, help='Re-referencing method (default: none)')
     parser.add_argument('--bandpass', type=float, nargs=2, metavar=('LOW', 'HIGH'),
@@ -96,10 +96,14 @@ Examples:
     # Apply preprocessing
     print("\nApplying preprocessing...")
     bandpass_range = tuple(args.bandpass) if args.bandpass else None
+    
+    # Determine reference (CLI arg overrides config if provided)
+    reference = args.reference if args.reference is not None else config.REFERENCE
+    
     processed_data = preprocess_eeg(
         eeg_data_obj.data,
         eeg_data_obj.srate,
-        reference=args.reference,
+        reference=reference,
         bandpass=bandpass_range
     )
     
@@ -141,8 +145,10 @@ Examples:
         epoch_manager=epoch_manager,
         annotation_manager=annotation_manager,
         focus_channels=args.channels,
+        main_plot_channels=config.MAIN_PLOT_CHANNELS,
         chanlocs=eeg_data_obj.chanlocs,  # Pass channel locations for topoplots
         channels_file=channels_file,
+        exclude_channels=config.EXCLUDE_CHANNELS,
     )
     
     # Wrap in a servable template
@@ -170,4 +176,3 @@ Examples:
 
 if __name__ == '__main__':
     main()
-
