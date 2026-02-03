@@ -37,6 +37,12 @@ ANNOTATION_COLORS = {
     'KC': '#27ae60',           # Green  
 }
 
+# Display settings: show extra context around each epoch
+# Epoch progression/hop remains controlled by EpochManager.epoch_length_sec (e.g. 20s).
+DISPLAY_CONTEXT_BEFORE_SEC = 5.0
+DISPLAY_CONTEXT_AFTER_SEC = 5.0
+CONTEXT_BACKGROUND_COLOR = '#cfe8ff'  # light blue
+
 def downsample_minmax(data: np.ndarray, time: np.ndarray, max_points: int = 4000) -> tuple:
     n = len(data)
     if n <= max_points: return time, data
@@ -141,7 +147,10 @@ class EEGDashboard(param.Parameterized):
                  main_plot_channels: List[int] = None,
                  chanlocs: pd.DataFrame = None, 
                  channels_file: Optional[str] = None,
-                 exclude_channels: List[int] = None, **params):
+                 exclude_channels: List[int] = None,
+                 plot_width: int = 1200,
+                 plot_height: int = 500,
+                 **params):
         
         # --- FIX: Set attributes BEFORE super().__init__ ---
         # This prevents "AttributeError" if watchers fire during init
@@ -150,6 +159,8 @@ class EEGDashboard(param.Parameterized):
         self.focus_channels = focus_channels or [34, 55, 70]
         self.main_plot_channels = main_plot_channels
         self.exclude_channels = exclude_channels or []
+        self.plot_width = int(plot_width)
+        self.plot_height = int(plot_height)
         self.sampling_rate = epoch_manager.sampling_rate
         self.chanlocs = chanlocs if chanlocs is not None else pd.DataFrame()
         
@@ -201,10 +212,18 @@ class EEGDashboard(param.Parameterized):
         self._click_debounce_time = 0.3  # 300ms debounce for clicks
         self._processing_click = False
         
+        # Track when epoch actually changes (for box selection clearing)
+        self._previous_epoch_index = -1
+        self._should_clear_box_selection = False
+        self._should_clear_box_selection_focus = False
+        
         # Now call super, which might trigger watchers immediately
         super().__init__(**params)
         
         self.param.epoch_index.bounds = (0, max(0, epoch_manager.get_epoch_count() - 1))
+        
+        # Initialize previous epoch index to current value
+        self._previous_epoch_index = self.epoch_index
         
         # Initialize Tap stream for selecting existing regions
         self.tap_stream = streams.Tap(transient=True)
@@ -277,6 +296,9 @@ class EEGDashboard(param.Parameterized):
             self._cached_epoch_data = epoch_data
             self._cached_epoch_data_index = self.epoch_index
             self._cached_epoch_start = int(epoch_info['start_idx'])
+            # IMPORTANT: Regions are epoch-dependent. If epoch_data changed, any cached
+            # regions from the previous epoch are invalid and must be refreshed.
+            self._cached_regions = None
         else:
             # Epoch_data cached, but regions need refresh
             epoch_info = self.epoch_manager.get_current_epoch_info()
@@ -292,6 +314,65 @@ class EEGDashboard(param.Parameterized):
             current_regions = self._cached_regions
         
         return epoch_data, current_regions, self._cached_epoch_start
+
+    def _get_display_window_data(self) -> Tuple[pd.DataFrame, int, int, float, float]:
+        """
+        Get a display window around the current epoch with context:
+        - DISPLAY_CONTEXT_BEFORE_SEC seconds before epoch start
+        - DISPLAY_CONTEXT_AFTER_SEC seconds after epoch end
+
+        Returns:
+            display_df: DataFrame of samples in the display window
+            pre_samples: number of samples shown before the epoch start (may be < target near recording start)
+            post_samples: number of samples shown after the epoch end (may be < target near recording end)
+            center_start_time_s: time (s) in display window where the *epoch* starts
+            center_end_time_s: time (s) in display window where the *epoch* ends
+        """
+        if (hasattr(self, '_cached_display_epoch_index') and
+            self._cached_display_epoch_index == self.epoch_index and
+            getattr(self, '_cached_display_df', None) is not None):
+            return (self._cached_display_df,
+                    self._cached_display_pre_samples,
+                    self._cached_display_post_samples,
+                    self._cached_display_center_start_time_s,
+                    self._cached_display_center_end_time_s)
+
+        # Ensure epoch manager is on the current filtered epoch
+        self.epoch_manager.current_epoch_idx = self.epoch_index
+        epoch_info = self.epoch_manager.get_current_epoch_info()
+        if not epoch_info:
+            empty = pd.DataFrame()
+            return empty, 0, 0, 0.0, 0.0
+
+        epoch_start = int(epoch_info['start_idx'])
+        epoch_end = int(epoch_info['end_idx'])  # inclusive
+
+        sr = float(self.sampling_rate)
+        pre_target = int(DISPLAY_CONTEXT_BEFORE_SEC * sr)
+        post_target = int(DISPLAY_CONTEXT_AFTER_SEC * sr)
+
+        n_samples_total = len(self.epoch_manager.eeg_data)
+        win_start = max(0, epoch_start - pre_target)
+        win_end = min(n_samples_total - 1, epoch_end + post_target)  # inclusive
+
+        display_df = self.epoch_manager.eeg_data.iloc[win_start:win_end + 1].copy()
+
+        pre_samples = int(epoch_start - win_start)
+        post_samples = int(win_end - epoch_end)
+
+        epoch_len_samples = int(epoch_end - epoch_start + 1)
+        center_start_time_s = pre_samples / sr
+        center_end_time_s = (pre_samples + epoch_len_samples) / sr
+
+        # Cache
+        self._cached_display_epoch_index = self.epoch_index
+        self._cached_display_df = display_df
+        self._cached_display_pre_samples = pre_samples
+        self._cached_display_post_samples = post_samples
+        self._cached_display_center_start_time_s = center_start_time_s
+        self._cached_display_center_end_time_s = center_end_time_s
+
+        return display_df, pre_samples, post_samples, center_start_time_s, center_end_time_s
     
     def _create_time_axis(self, n): 
         return np.arange(n) / self.sampling_rate
@@ -331,9 +412,14 @@ class EEGDashboard(param.Parameterized):
             if epoch_data is None:
                 return
             
-            # Convert time to sample indices (relative to epoch)
-            start_idx = int(start_time * self.sampling_rate)
-            stop_idx = int(end_time * self.sampling_rate)
+            # Convert time to sample indices (relative to DISPLAY WINDOW),
+            # then map to indices relative to the EPOCH by subtracting pre-context.
+            _, pre_samples, _, center_start_time_s, center_end_time_s = self._get_display_window_data()
+            start_idx_display = int(start_time * self.sampling_rate)
+            stop_idx_display = int(end_time * self.sampling_rate)
+
+            start_idx = start_idx_display - pre_samples
+            stop_idx = stop_idx_display - pre_samples
             
             # Clamp to epoch boundaries
             start_idx = max(0, min(start_idx, len(epoch_data) - 1))
@@ -343,7 +429,10 @@ class EEGDashboard(param.Parameterized):
                 print("⚠️ Invalid selection: start >= stop")
                 return
             
-            print(f"📦 Box selected: {start_time:.3f}s - {end_time:.3f}s (samples {start_idx}-{stop_idx})")
+            print(
+                f"📦 Box selected (display): {start_time:.3f}s - {end_time:.3f}s | "
+                f"(epoch-relative samples {start_idx}-{stop_idx}, epoch window {center_start_time_s:.1f}s-{center_end_time_s:.1f}s)"
+            )
             
             # Store last bounds to prevent duplicate processing
             self._last_bounds = bounds
@@ -379,7 +468,9 @@ class EEGDashboard(param.Parameterized):
         # Debounce: ignore rapid repeated clicks on the same region
         current_time = time_module.time()
         click_time = x
-        click_sample = int(click_time * self.sampling_rate)
+        click_sample_display = int(click_time * self.sampling_rate)
+        _, pre_samples, _, _, _ = self._get_display_window_data()
+        click_sample = click_sample_display - pre_samples
         
         # Check if this is a duplicate click
         if (self._last_click_region is not None and 
@@ -395,11 +486,18 @@ class EEGDashboard(param.Parameterized):
         
         try:
             t0 = time_module.time()
-            
-            _, current_regions, _ = self._get_epoch_data()
+
+            # Ignore clicks in the context-only areas (outside the current epoch window)
+            epoch_data, current_regions, _ = self._get_epoch_data()
+            if epoch_data is None or len(epoch_data) == 0:
+                return
             t1 = time_module.time()
-            
+
             if not current_regions:
+                return
+
+            epoch_len_samples = len(epoch_data)
+            if click_sample < 0 or click_sample > epoch_len_samples:
                 return
 
             # Find region that contains the click point
@@ -718,7 +816,8 @@ class EEGDashboard(param.Parameterized):
         return hover
     
     def _create_selected_regions(self, regions: dict, y_range: Tuple[float, float], 
-                                epoch_data: Optional[pd.DataFrame] = None):
+                                epoch_data: Optional[pd.DataFrame] = None,
+                                time_offset_seconds: float = 0.0):
         """Create rectangles for selected regions."""
         if not regions:
             return hv.Rectangles([], kdims=['x0', 'y0', 'x1', 'y1'])
@@ -763,9 +862,9 @@ class EEGDashboard(param.Parameterized):
                 lw = 2
                 alpha = 0.15  # Transparent so EEG shows through
             
-            # Convert sample indices to time
-            start_time = rel_start / self.sampling_rate
-            stop_time = rel_stop / self.sampling_rate
+            # Convert sample indices to time, shifting by time_offset_seconds (e.g. pre-context)
+            start_time = (rel_start / self.sampling_rate) + time_offset_seconds
+            stop_time = (rel_stop / self.sampling_rate) + time_offset_seconds
             
             # Check if topoplot is cached (lazy loading - only show if already generated)
             topo_html = ''
@@ -824,7 +923,11 @@ class EEGDashboard(param.Parameterized):
             delattr(self, '_last_bounds')
         
         # Clear epoch_data cache if epoch changed
-        if self._cached_epoch_data_index != self.epoch_index:
+        epoch_changed_for_cache = (self._cached_epoch_data_index != self.epoch_index)
+        # Check if epoch_index param actually changed (not just update_trigger)
+        epoch_index_changed = (self._previous_epoch_index != self.epoch_index)
+        
+        if epoch_changed_for_cache:
             self._cached_epoch_data = None
             self._cached_regions = None
             self._cached_epoch_start = None
@@ -834,11 +937,32 @@ class EEGDashboard(param.Parameterized):
             # Trigger focus plot update
             self.focus_plot_trigger += 1
         
+        # Set flag to clear box selection only when epoch_index actually changes
+        if epoch_index_changed:
+            self._should_clear_box_selection = True
+            self._should_clear_box_selection_focus = True
+            self._previous_epoch_index = self.epoch_index
+            # Clear box selection bounds when epoch changes
+            if hasattr(self, '_bounds_stream') and self._bounds_stream is not None:
+                try:
+                    # Reset bounds stream to clear visual selection
+                    self._bounds_stream.event(bounds=None)
+                except:
+                    pass
+            if hasattr(self, '_bounds_stream_focus') and self._bounds_stream_focus is not None:
+                try:
+                    # Reset focus bounds stream to clear visual selection
+                    self._bounds_stream_focus.event(bounds=None)
+                except:
+                    pass
+        
         t1 = time_module.time()
+        # Central epoch data (for annotations/topoplots) + display window (for plotting)
         epoch_data, current_regions, _ = self._get_epoch_data()
+        display_df, pre_samples, post_samples, center_start_time_s, center_end_time_s = self._get_display_window_data()
         t2 = time_module.time()
         
-        if epoch_data is None or len(epoch_data) == 0:
+        if epoch_data is None or len(epoch_data) == 0 or display_df is None or len(display_df) == 0:
             if epoch_data is None:
                 print(f"⚠️ epoch_data is None in create_main_plot")
             else:
@@ -850,7 +974,7 @@ class EEGDashboard(param.Parameterized):
         
         if epoch_changed or self._cached_curves is None:
             # Recreate curves when epoch changes
-            t = self._create_time_axis(len(epoch_data))
+            t = self._create_time_axis(len(display_df))
             self._cached_time_axis = t
             
             # Butterfly plot: Subset of channels for performance
@@ -864,14 +988,14 @@ class EEGDashboard(param.Parameterized):
             # Determine which channels to plot
             if self.main_plot_channels is not None:
                 # Use configured channels, filtering out any that are out of bounds
-                n_total = len(epoch_data.columns)
+                n_total = len(display_df.columns)
                 indices = [i for i in self.main_plot_channels if 0 <= i < n_total]
                 if not indices:
                     print("Warning: No valid channels in main_plot_channels. Falling back to default.")
                     indices = list(range(min(30, n_total)))
             else:
                 # Limit to ~30 channels max to keep UI responsive
-                n_channels = len(epoch_data.columns)
+                n_channels = len(display_df.columns)
                 target_n_channels = 30
                 if n_channels > target_n_channels:
                     step = max(1, n_channels // target_n_channels)
@@ -880,8 +1004,8 @@ class EEGDashboard(param.Parameterized):
                     indices = list(range(n_channels))
             
             for i_idx, i in enumerate(indices):
-                col = epoch_data.columns[i]
-                d = epoch_data[col].values
+                col = display_df.columns[i]
+                d = display_df[col].values
                 # Normalize but don't offset (all on same scale)
                 d_normalized = (d - np.mean(d)) / (np.std(d) or 1) * 30
                 
@@ -916,12 +1040,10 @@ class EEGDashboard(param.Parameterized):
                     )
                     curves.append(curve)
             
-            # Calculate dynamic range with padding and clipping
-            y_pad = (y_data_max - y_data_min) * 0.1
-            if y_pad == 0: y_pad = 10
-            
-            y_limit_min = max(-300, y_data_min - y_pad)
-            y_limit_max = min(300, y_data_max + y_pad)
+            # Use fixed range for butterfly plot (requested: ~-230 to +230)
+            # The normalized data is already scaled to ~30 units, so we use a fixed range
+            y_limit_min = -230
+            y_limit_max = 230
             
             # Cache curves and epoch index
             self._cached_curves = curves
@@ -955,11 +1077,35 @@ class EEGDashboard(param.Parameterized):
         
         t3 = time_module.time()
         # Add region rectangles
-        regions_rects = self._create_selected_regions(current_regions, y_range, epoch_data)
+        regions_rects = self._create_selected_regions(
+            current_regions,
+            y_range,
+            epoch_data,  # central epoch for topoplot indexing
+            time_offset_seconds=center_start_time_s
+        )
         t4 = time_module.time()
         
-        # Create combined plot
-        combined = hv.Overlay(curves) * regions_rects
+        # Background shading for context regions (pre/post)
+        vspans = []
+        if pre_samples > 0 and center_start_time_s > 0:
+            vspans.append(
+                hv.VSpan(0.0, center_start_time_s).opts(
+                    color=CONTEXT_BACKGROUND_COLOR, alpha=0.25, line_width=0
+                )
+            )
+        display_duration_s = len(display_df) / self.sampling_rate
+        if post_samples > 0 and center_end_time_s < display_duration_s:
+            vspans.append(
+                hv.VSpan(center_end_time_s, display_duration_s).opts(
+                    color=CONTEXT_BACKGROUND_COLOR, alpha=0.25, line_width=0
+                )
+            )
+
+        # Create combined plot (background spans behind curves, then regions)
+        elements = []
+        elements.extend(vspans)
+        elements.extend(curves)
+        combined = hv.Overlay(elements) * regions_rects
         t5 = time_module.time()
         
         # Performance logging
@@ -983,13 +1129,44 @@ class EEGDashboard(param.Parameterized):
             self._plot_creation_times.pop(0)
         
         # Set plot options with y_range customization hook
+        # Use local variables to ensure this plot's range is independent
+        butterfly_y_min = y_limit_min
+        butterfly_y_max = y_limit_max
+        
         def set_y_range(plot, element):
-            """Hook to set y-axis range dynamically"""
+            """Hook to set y-axis range dynamically and lock it - BUTTERFLY PLOT ONLY"""
             # Access the y_range directly from handles
             if hasattr(plot, 'handles') and 'y_range' in plot.handles:
                 y_range_handle = plot.handles['y_range']
-                y_range_handle.start = y_limit_min
-                y_range_handle.end = y_limit_max
+                # Use local variables to ensure independence from other plots
+                # Force set to butterfly plot range only
+                y_range_handle.start = butterfly_y_min
+                y_range_handle.end = butterfly_y_max
+                # Prevent auto-scaling by setting bounds
+                y_range_handle.bounds = (butterfly_y_min, butterfly_y_max)
+                # Disable auto-range
+                if hasattr(y_range_handle, 'reset_start'):
+                    y_range_handle.reset_start = butterfly_y_min
+                    y_range_handle.reset_end = butterfly_y_max
+                # Ensure range doesn't auto-update
+                if hasattr(y_range_handle, 'auto_range'):
+                    y_range_handle.auto_range = False
+        
+        # Additional hook to re-lock range after any update
+        def lock_y_range(plot, element):
+            """Re-lock y-axis range after plot updates - BUTTERFLY PLOT ONLY"""
+            if hasattr(plot, 'handles') and 'y_range' in plot.handles:
+                y_range_handle = plot.handles['y_range']
+                # Always force range back to butterfly plot values - use local variables
+                # Don't check, just force it to be correct
+                y_range_handle.start = butterfly_y_min
+                y_range_handle.end = butterfly_y_max
+                y_range_handle.bounds = (butterfly_y_min, butterfly_y_max)
+                if hasattr(y_range_handle, 'auto_range'):
+                    y_range_handle.auto_range = False
+                if hasattr(y_range_handle, 'reset_start'):
+                    y_range_handle.reset_start = butterfly_y_min
+                    y_range_handle.reset_end = butterfly_y_max
         
         # Hook to ensure box_select tool is enabled after plot updates
         def ensure_box_select(plot, element):
@@ -1010,6 +1187,7 @@ class EEGDashboard(param.Parameterized):
             drastically improving performance when many channels are displayed.
             """
             from bokeh.models import BoxSelectTool
+            from bokeh.models.glyphs import Line
             
             # Find the BoxSelectTool
             box_select = None
@@ -1019,23 +1197,364 @@ class EEGDashboard(param.Parameterized):
                         box_select = tool
                         break
             
-            # Restrict renderers to the first one (first curve)
+            # Restrict renderers to the first *line* renderer (skip spans/rectangles)
             if box_select and hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
                 renderers = plot.handles['glyph_renderers']
                 if renderers:
-                    # The first renderer corresponds to the first curve added to the overlay
-                    box_select.renderers = [renderers[0]]
+                    line_renderer = None
+                    for r in renderers:
+                        try:
+                            if hasattr(r, 'glyph') and isinstance(r.glyph, Line):
+                                line_renderer = r
+                                break
+                        except Exception:
+                            continue
+                    if line_renderer is None:
+                        line_renderer = renderers[0]
+                    box_select.renderers = [line_renderer]
+        
+        # Hook to clear box selection when epoch changes
+        def clear_box_selection(plot, element):
+            """Clear BoxSelectTool visual selection - BUTTERFLY PLOT"""
+            from bokeh.models import BoxSelectTool
+            
+            # Only clear if epoch_index actually changed (not just update_trigger)
+            if self._should_clear_box_selection:
+                if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                    for tool in plot.state.tools:
+                        if isinstance(tool, BoxSelectTool):
+                            # Clear the selection overlay (visual box)
+                            if hasattr(tool, 'overlay'):
+                                tool.overlay.left = None
+                                tool.overlay.right = None
+                                tool.overlay.top = None
+                                tool.overlay.bottom = None
+                            # Clear any selection on renderers
+                            if hasattr(tool, 'renderers') and tool.renderers:
+                                for renderer in tool.renderers:
+                                    if hasattr(renderer, 'data_source'):
+                                        # Clear selection indices
+                                        if hasattr(renderer.data_source, 'selected'):
+                                            renderer.data_source.selected.indices = []
+                            break
+                # Clear the flag after clearing
+                self._should_clear_box_selection = False
         
         plot_opts = opts.Overlay(
-            width=1200, height=500, shared_axes=True, show_legend=False, 
+            width=self.plot_width, height=self.plot_height, shared_axes=True, show_legend=False, 
             tools=['tap', 'hover', 'xwheel_zoom', 'xpan','box_select'], 
             active_tools=['tap', 'box_select'],
-            hooks=[set_y_range, ensure_box_select, optimize_selection],
-            #ylim=(y_limit_min, y_limit_max),
-            #framewise=True
+            hooks=[set_y_range, lock_y_range, clear_box_selection, ensure_box_select, optimize_selection],
+            ylim=(butterfly_y_min, butterfly_y_max),  # Explicitly set ylim to prevent auto-scaling - BUTTERFLY PLOT ONLY
+            framewise=False,  # Prevent auto-scaling on updates
         )
         
-        return combined.opts(plot_opts)s
+        return combined.opts(plot_opts)
+
+    @param.depends('epoch_index', 'update_trigger')
+    def create_focus_channels_plot(self, bounds=None, **kwargs):
+        """Create stacked plot with 3 focus channels displayed above each other."""
+        import time as time_module
+        t0 = time_module.time()
+        
+        # Clear last bounds when epoch changes to allow new selections
+        if hasattr(self, '_last_bounds'):
+            delattr(self, '_last_bounds')
+        
+        # Check if epoch_index actually changed (not just update_trigger)
+        # The flag is set in create_main_plot, so we just check it here
+        epoch_changed_for_focus = (self._cached_epoch_data_index != self.epoch_index)
+        
+        epoch_data, current_regions, _ = self._get_epoch_data()  # central epoch (for annotations/topoplots)
+        display_df, pre_samples, post_samples, center_start_time_s, center_end_time_s = self._get_display_window_data()
+        t1 = time_module.time()
+        
+        if epoch_data is None or len(epoch_data) == 0 or display_df is None or len(display_df) == 0:
+            return hv.Spacer()
+        
+        # Check if we have valid focus channels
+        if not self.focus_channels or len(self.focus_channels) == 0:
+            return hv.Spacer()
+        
+        # Validate channel indices
+        n_channels = len(display_df.columns)
+        valid_channels = [ch for ch in self.focus_channels if 0 <= ch < n_channels]
+        if not valid_channels:
+            return hv.Spacer()
+        
+        t = self._create_time_axis(len(display_df))
+        
+        # Create curves for each focus channel with vertical offsets
+        # Normalize each channel similar to butterfly plot, then apply offsets
+        curves = []
+        first_curve = None
+        offset_per_channel = 500  # Vertical spacing between channels
+        channel_range = 230  # Match butterfly range: -230..230 per channel
+        
+        for i_idx, channel_idx in enumerate(valid_channels):
+            col = display_df.columns[channel_idx]
+            d = display_df[col].values
+            
+            # Normalize channel similar to butterfly plot (scale to ~30 units)
+            d_normalized = (d - np.mean(d)) / (np.std(d) or 1) * 30
+            
+            # Apply vertical offset: channel 0 at 0, channel 1 at +500, channel 2 at +1000
+            offset = i_idx * offset_per_channel
+            d_offset = d_normalized + offset
+            
+            tt, dd = downsample_minmax(d_offset, t)
+            color = self._get_channel_color(channel_idx)
+            
+            # Create curve with explicit y-range to prevent auto-scaling
+            curve_opts = {
+                'color': color,
+                'line_width': 1.5,
+                'alpha': 0.8,
+            }
+            
+            if i_idx == 0:
+                # First curve: enable box_select and store reference
+                curve_opts['tools'] = ['box_select', 'tap', 'hover']
+                first_curve = hv.Curve((tt, dd), label=f'Ch {channel_idx}').opts(**curve_opts)
+                curves.append(first_curve)
+            else:
+                curve = hv.Curve((tt, dd), label=f'Ch {channel_idx}').opts(**curve_opts)
+                curves.append(curve)
+        
+        # Calculate y_range to cover all stacked channels
+        # Each normalized channel spans roughly -250 to +250, with offsets
+        y_min = -channel_range
+        y_max = (len(valid_channels) - 1) * offset_per_channel + channel_range
+        y_range = (y_min, y_max)
+        
+        t2 = time_module.time()
+        # Add region rectangles spanning the full y-range (shifted by pre-context)
+        regions_rects = self._create_selected_regions(
+            current_regions,
+            y_range,
+            epoch_data,  # central epoch for topoplot indexing
+            time_offset_seconds=center_start_time_s
+        )
+        t3 = time_module.time()
+        
+        # Background shading for context regions (pre/post)
+        vspans = []
+        if pre_samples > 0 and center_start_time_s > 0:
+            vspans.append(
+                hv.VSpan(0.0, center_start_time_s).opts(
+                    color=CONTEXT_BACKGROUND_COLOR, alpha=0.25, line_width=0
+                )
+            )
+        display_duration_s = len(display_df) / self.sampling_rate
+        if post_samples > 0 and center_end_time_s < display_duration_s:
+            vspans.append(
+                hv.VSpan(center_end_time_s, display_duration_s).opts(
+                    color=CONTEXT_BACKGROUND_COLOR, alpha=0.25, line_width=0
+                )
+            )
+
+        # Create combined plot (background spans behind curves, then regions)
+        elements = []
+        elements.extend(vspans)
+        elements.extend(curves)
+        combined = hv.Overlay(elements) * regions_rects
+        # Set the range directly on the element to ensure it's preserved
+        combined = combined.redim.range(y=(y_min, y_max))
+        t4 = time_module.time()
+        
+        # Update bounds stream source to first curve for box selection
+        # Do this in a hook to avoid triggering plot recreation during creation
+        def update_bounds_stream(plot, element):
+            """Update bounds stream source after plot is created"""
+            if first_curve is not None and hasattr(self, '_bounds_stream_focus') and self._bounds_stream_focus is not None:
+                try:
+                    # Use the HoloViews element as the stream source (stable even with background spans)
+                    self._bounds_stream_focus.source = first_curve
+                except Exception as e:
+                    print(f"Warning: Failed to update focus bounds stream source: {e}")
+        
+        # Store the update function to be called in hooks
+        update_bounds_stream_fn = update_bounds_stream
+        
+        # Hook to set y-axis range dynamically and prevent auto-scaling
+        # Use local variables to ensure this plot's range is independent from butterfly plot
+        focus_y_min = y_min
+        focus_y_max = y_max
+
+        def apply_stacked_yaxis_format(plot):
+            """Apply repeated -range..range tick labels for stacked channels."""
+            if hasattr(plot, 'state') and hasattr(plot.state, 'yaxis') and plot.state.yaxis:
+                from bokeh.models import FixedTicker, FuncTickFormatter
+
+                ticks = []
+                for i_stack in range(len(valid_channels)):
+                    base = i_stack * offset_per_channel
+                    for v in (-channel_range, 0, channel_range):
+                        ticks.append(base + v)
+
+                plot.state.yaxis[0].ticker = FixedTicker(ticks=ticks)
+                plot.state.yaxis[0].formatter = FuncTickFormatter(code=f"""
+                    const offset = {offset_per_channel};
+                    let v = tick - Math.floor(tick/offset)*offset;
+                    if (v > offset/2) v -= offset;
+                    return v.toFixed(0);
+                """)
+                plot.state.yaxis[0].axis_label = "Amplitude (normalized)"
+        
+        def set_y_range(plot, element):
+            """Hook to set y-axis range dynamically and lock it - 3-CHANNEL PLOT ONLY"""
+            if hasattr(plot, 'handles') and 'y_range' in plot.handles:
+                y_range_handle = plot.handles['y_range']
+                # Force set the range immediately - use local variables for 3-channel plot
+                # This ensures independence from butterfly plot
+                y_range_handle.start = focus_y_min
+                y_range_handle.end = focus_y_max
+                y_range_handle.bounds = (focus_y_min, focus_y_max)
+                # Disable auto-range - this is critical
+                if hasattr(y_range_handle, 'auto_range'):
+                    y_range_handle.auto_range = False
+                if hasattr(y_range_handle, 'reset_start'):
+                    y_range_handle.reset_start = focus_y_min
+                    y_range_handle.reset_end = focus_y_max
+                
+                # Add a post-render callback to ensure range stays locked
+                # This runs after Bokeh renders the plot
+                if hasattr(plot, 'state') and hasattr(plot.state, 'document'):
+                    # Use a document callback to lock range after render
+                    def lock_after_render():
+                        try:
+                            y_range_handle.start = focus_y_min
+                            y_range_handle.end = focus_y_max
+                            y_range_handle.bounds = (focus_y_min, focus_y_max)
+                            if hasattr(y_range_handle, 'auto_range'):
+                                y_range_handle.auto_range = False
+                        except:
+                            pass
+                    
+                    # Schedule callback after next render
+                    if hasattr(plot.state.document, 'add_next_tick_callback'):
+                        plot.state.document.add_next_tick_callback(lock_after_render)
+                
+                # Also set on plot state if available
+                if hasattr(plot, 'state') and hasattr(plot.state, 'y_range'):
+                    plot.state.y_range.start = focus_y_min
+                    plot.state.y_range.end = focus_y_max
+                    plot.state.y_range.bounds = (focus_y_min, focus_y_max)
+                    if hasattr(plot.state.y_range, 'auto_range'):
+                        plot.state.y_range.auto_range = False
+                # Ensure tick labels remain correct even after plot updates
+                apply_stacked_yaxis_format(plot)
+        
+        # Additional hook to re-lock range after any update - runs after set_y_range
+        # This ensures the range stays locked even if something tries to change it
+        def lock_y_range(plot, element):
+            """Re-lock y-axis range after plot updates - 3-CHANNEL PLOT ONLY"""
+            if hasattr(plot, 'handles') and 'y_range' in plot.handles:
+                y_range_handle = plot.handles['y_range']
+                # Always force range back to 3-channel plot values - use local variables
+                # Don't check, just force it to be correct for this plot only
+                y_range_handle.start = focus_y_min
+                y_range_handle.end = focus_y_max
+                y_range_handle.bounds = (focus_y_min, focus_y_max)
+                if hasattr(y_range_handle, 'auto_range'):
+                    y_range_handle.auto_range = False
+                if hasattr(y_range_handle, 'reset_start'):
+                    y_range_handle.reset_start = focus_y_min
+                    y_range_handle.reset_end = focus_y_max
+            # Also update plot state if available
+            if hasattr(plot, 'state') and hasattr(plot.state, 'y_range'):
+                plot.state.y_range.start = focus_y_min
+                plot.state.y_range.end = focus_y_max
+                plot.state.y_range.bounds = (focus_y_min, focus_y_max)
+                if hasattr(plot.state.y_range, 'auto_range'):
+                    plot.state.y_range.auto_range = False
+            # Re-apply stacked y-axis formatting; Bokeh can reset it after selection updates
+            apply_stacked_yaxis_format(plot)
+        
+        # Hook to ensure box_select tool is enabled
+        def ensure_box_select(plot, element):
+            """Ensure box_select tool is enabled on the plot"""
+            if hasattr(plot, 'state') and hasattr(plot.state, 'toolbar'):
+                for tool in plot.state.toolbar.tools:
+                    if hasattr(tool, 'name') and tool.name == 'box_select':
+                        if not hasattr(tool, 'active') or not tool.active:
+                            tool.active = True
+                        break
+        
+        # Hook to optimize selection tool
+        def optimize_selection(plot, element):
+            """Hook to restrict BoxSelectTool to only the first renderer."""
+            from bokeh.models import BoxSelectTool
+            from bokeh.models.glyphs import Line
+            
+            box_select = None
+            if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                for tool in plot.state.tools:
+                    if isinstance(tool, BoxSelectTool):
+                        box_select = tool
+                        break
+            
+            if box_select and hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
+                renderers = plot.handles['glyph_renderers']
+                if renderers:
+                    # Choose the first *line* renderer (skip spans/rectangles)
+                    line_renderer = None
+                    for r in renderers:
+                        try:
+                            if hasattr(r, 'glyph') and isinstance(r.glyph, Line):
+                                line_renderer = r
+                                break
+                        except Exception:
+                            continue
+                    if line_renderer is None:
+                        line_renderer = renderers[0]
+                    box_select.renderers = [line_renderer]
+        
+        # Hook to clear box selection when epoch changes - 3-CHANNEL PLOT
+        def clear_box_selection_focus(plot, element):
+            """Clear BoxSelectTool visual selection - 3-CHANNEL PLOT"""
+            from bokeh.models import BoxSelectTool
+            
+            # Only clear if epoch_index actually changed (not just update_trigger)
+            if self._should_clear_box_selection_focus:
+                if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                    for tool in plot.state.tools:
+                        if isinstance(tool, BoxSelectTool):
+                            # Clear the selection overlay (visual box)
+                            if hasattr(tool, 'overlay'):
+                                tool.overlay.left = None
+                                tool.overlay.right = None
+                                tool.overlay.top = None
+                                tool.overlay.bottom = None
+                            # Clear any selection on renderers
+                            if hasattr(tool, 'renderers') and tool.renderers:
+                                for renderer in tool.renderers:
+                                    if hasattr(renderer, 'data_source'):
+                                        # Clear selection indices
+                                        if hasattr(renderer.data_source, 'selected'):
+                                            renderer.data_source.selected.indices = []
+                            break
+                # Clear the flag after clearing
+                self._should_clear_box_selection_focus = False
+        
+        # Build hooks list - ensure bounds stream update happens after range is set
+        hooks_list = [set_y_range, lock_y_range, clear_box_selection_focus, update_bounds_stream_fn, ensure_box_select, optimize_selection]
+        
+        plot_opts = opts.Overlay(
+            width=self.plot_width, height=self.plot_height, shared_axes=True, show_legend=False,
+            tools=['tap', 'hover', 'xwheel_zoom', 'xpan', 'box_select'],
+            active_tools=['tap', 'box_select'],
+            hooks=hooks_list,
+            ylim=(focus_y_min, focus_y_max),  # Explicitly set ylim to prevent auto-scaling - 3-CHANNEL PLOT ONLY
+            framewise=False,  # Critical: prevent auto-scaling on updates
+        )
+        
+        t5 = time_module.time()
+        total_time = (t5 - t0) * 1000
+        if total_time > 50:
+            print(f"⏱️ create_focus_channels_plot: get_epoch_data={((t1-t0)*1000):.1f}ms, curves={((t2-t1)*1000):.1f}ms, regions={((t3-t2)*1000):.1f}ms, overlay={((t4-t3)*1000):.1f}ms, opts={((t5-t4)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
+        
+        return combined.opts(plot_opts)
 
     @param.depends('epoch_index', 'focus_plot_trigger')
     def create_focus_plot(self, channel_idx, **kwargs):
@@ -1082,7 +1601,7 @@ class EEGDashboard(param.Parameterized):
         
         t2 = time_module.time()
         result = (curve * regions_rects).opts(
-            opts.Overlay(width=1200, height=150, shared_axes=True, xaxis=None, ylabel=f"Ch {channel_idx}", hooks=[set_y_range_focus])
+            opts.Overlay(width=self.plot_width, height=150, shared_axes=True, xaxis=None, ylabel=f"Ch {channel_idx}", hooks=[set_y_range_focus])
         )
         t3 = time_module.time()
         
@@ -1127,27 +1646,22 @@ class EEGDashboard(param.Parameterized):
         .bk-btn-group .bk-btn:nth-child(2) { background-color: #95a5a6 !important; color: white !important; }
         </style>""")
 
-        # Create bounds stream for box selection - source will be set in create_main_plot
+        # Create bounds stream for box selection - source will be set in create_focus_channels_plot
         # Initialize it here but source will be updated when plot is created
+        if not hasattr(self, '_bounds_stream_focus') or self._bounds_stream_focus is None:
+            self._bounds_stream_focus = streams.BoundsXY()
+            self._bounds_stream_focus.add_subscriber(self._on_box_select)
+        
+        # Create bounds stream for butterfly plot (main plot)
         if not hasattr(self, '_bounds_stream') or self._bounds_stream is None:
             self._bounds_stream = streams.BoundsXY()
             self._bounds_stream.add_subscriber(self._on_box_select)
         
-        # Create main plot with both tap and bounds streams
+        # Create focus channels plot (stacked 3 channels) with tap and bounds streams
+        focus_channels_dmap = hv.DynamicMap(self.create_focus_channels_plot, streams=[self.tap_stream, self._bounds_stream_focus])
+        
+        # Create main plot (butterfly) with both tap and bounds streams
         main_dmap = hv.DynamicMap(self.create_main_plot, streams=[self.tap_stream, self._bounds_stream])
-        
-        # Fix focus plots: use functools.partial or proper lambda to capture channel index
-        from functools import partial
-        
-        # Explicitly define streams for focus plots since partial() hides param.depends metadata
-        focus_streams = [hv.streams.Params(self, ['epoch_index', 'focus_plot_trigger'])]
-        
-        focus_dmaps = []
-        for ch_idx in self.focus_channels:
-            # Create a bound method that properly captures the channel index
-            focus_dmap = hv.DynamicMap(partial(self.create_focus_plot, channel_idx=ch_idx), streams=focus_streams)
-            focus_dmaps.append(focus_dmap)
-        focus_col = pn.Column(*[pn.pane.HoloViews(dmap) for dmap in focus_dmaps])
         
         # Compact layout with controls in a single row
         controls_row = pn.Row(
@@ -1164,10 +1678,8 @@ class EEGDashboard(param.Parameterized):
             margin=(5, 0)
         )
         
-        # Add topoplot panel to the right of focus plots
+        # Bottom row with topoplot panel
         bottom_row = pn.Row(
-            focus_col,
-            pn.Spacer(width=20),
             self.topoplot_panel,
             sizing_mode='stretch_width'
         )
@@ -1175,15 +1687,28 @@ class EEGDashboard(param.Parameterized):
         return pn.Column(
             self.status_bar,  # Status bar at top
             controls_row,  # Compact controls row
-            pn.pane.HoloViews(main_dmap, sizing_mode='stretch_width'),
-            bottom_row,
+            # IMPORTANT: disable cross-pane axis linking, otherwise the butterfly plot
+            # can inherit the stacked plot's y-range (e.g. -230..1230).
+            pn.pane.HoloViews(focus_channels_dmap, sizing_mode='stretch_width', linked_axes=False),  # NEW: stacked 3-channel plot
+            pn.pane.HoloViews(main_dmap, sizing_mode='stretch_width', linked_axes=False),  # MOVED: butterfly plot
+            bottom_row,  # Topoplot panel
             self.kb_listener,  # <--- INVISIBLE LISTENER COMPONENT
             style,
             sizing_mode='stretch_width',
             margin=(0, 10)
         )
 
-def create_dashboard(epoch_manager, annotation_manager, focus_channels=None, main_plot_channels=None, chanlocs=None, channels_file=None, exclude_channels=None):
+def create_dashboard(epoch_manager, annotation_manager, focus_channels=None, main_plot_channels=None, chanlocs=None, channels_file=None, exclude_channels=None, plot_width: int = 1200, plot_height: int = 500):
     """Create dashboard instance."""
-    db = EEGDashboard(epoch_manager, annotation_manager, focus_channels, main_plot_channels, chanlocs, channels_file, exclude_channels)
+    db = EEGDashboard(
+        epoch_manager,
+        annotation_manager,
+        focus_channels,
+        main_plot_channels,
+        chanlocs,
+        channels_file,
+        exclude_channels,
+        plot_width=plot_width,
+        plot_height=plot_height,
+    )
     return db.view()
