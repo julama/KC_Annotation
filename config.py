@@ -4,7 +4,7 @@
 EPOCH_LENGTH_SECONDS = 20.0
 
 # Default channel indices to display individually (0-based)
-DEFAULT_CHANNEL_INDICES = [34, 35, 70]
+DEFAULT_CHANNEL_INDICES = [10, 5, 54]
 
 # Slow Wave filter parameters
 SW_FILTER_LOW = 0.5  # Hz

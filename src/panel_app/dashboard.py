@@ -825,7 +825,7 @@ class EEGDashboard(param.Parameterized):
         y_min, y_max = y_range
         rect_data = []
         
-        # Initialize cache if epoch changed (but don't generate topoplots yet - lazy loading)
+        # Initialize cache if epoch changed and generate topoplots for all regions upfront
         if epoch_data is not None and MNE_AVAILABLE:
             # Clear cache if epoch changed
             if self._current_epoch_for_cache != self.epoch_index:
@@ -835,6 +835,17 @@ class EEGDashboard(param.Parameterized):
             # Cache structure for this epoch
             if self.epoch_index not in self._topoplot_cache:
                 self._topoplot_cache[self.epoch_index] = {}
+            
+            # Generate topoplots for all regions upfront (for hover tooltip)
+            for region_id, region in regions.items():
+                rel_start = region.get('relative_start', region['start_idx'])
+                rel_stop = region.get('relative_stop', region['stop_idx'])
+                
+                # Generate topoplot if not already cached
+                if region_id not in self._topoplot_cache[self.epoch_index]:
+                    topo_img = self._create_topoplot_image(region_id, epoch_data, rel_start, rel_stop)
+                    if topo_img:
+                        self._topoplot_cache[self.epoch_index][region_id] = topo_img
         
         for region_id, region in regions.items():
             # Get relative indices for display
@@ -866,7 +877,7 @@ class EEGDashboard(param.Parameterized):
             start_time = (rel_start / self.sampling_rate) + time_offset_seconds
             stop_time = (rel_stop / self.sampling_rate) + time_offset_seconds
             
-            # Check if topoplot is cached (lazy loading - only show if already generated)
+            # Get topoplot HTML from cache (now pre-generated)
             topo_html = ''
             if epoch_data is not None and MNE_AVAILABLE:
                 if (self.epoch_index in self._topoplot_cache and 
@@ -1623,6 +1634,32 @@ class EEGDashboard(param.Parameterized):
         btn_prev.on_click(lambda e: setattr(self, 'epoch_index', max(0, self.epoch_index - 1)))
         btn_next.on_click(lambda e: setattr(self, 'epoch_index', self.epoch_index + 1))
         
+        # Epoch jump input
+        max_epoch = max(0, self.epoch_manager.get_epoch_count() - 1)
+        epoch_jump_input = pn.widgets.IntInput(
+            name='Epoch',
+            value=self.epoch_index,
+            start=0,
+            end=max_epoch,
+            width=80,
+            step=1
+        )
+        # Sync input with epoch_index changes
+        self.param.watch(lambda e: setattr(epoch_jump_input, 'value', e.new), 'epoch_index')
+        # Jump to epoch when input changes
+        def jump_to_epoch(event):
+            try:
+                new_idx = int(event.new)
+                if 0 <= new_idx <= max_epoch:
+                    self.epoch_index = new_idx
+                else:
+                    # Reset to current if out of bounds
+                    epoch_jump_input.value = self.epoch_index
+            except (ValueError, TypeError):
+                # Reset to current if invalid
+                epoch_jump_input.value = self.epoch_index
+        epoch_jump_input.param.watch(jump_to_epoch, 'value')
+        
         # Radio Buttons (only KC and unannotated)
         radio_group = pn.widgets.RadioButtonGroup(
             name='Annotation', options=['KC', 'unannotated'], 
@@ -1666,6 +1703,8 @@ class EEGDashboard(param.Parameterized):
         # Compact layout with controls in a single row
         controls_row = pn.Row(
             btn_prev, btn_next,
+            pn.Spacer(width=10),
+            epoch_jump_input,
             pn.Spacer(width=10),
             info,
             pn.Spacer(width=10),
