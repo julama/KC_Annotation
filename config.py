@@ -36,3 +36,7 @@ MAIN_PLOT_CHANNELS = [
 # - List[int]: Use average of specific channel indices (0-based, e.g., [48, 55] for mastoids)
 # - None: No re-referencing
 REFERENCE = [48, 55]
+
+# Threshold line for amplitude visualization
+# Set to None to disable threshold lines, or a numeric value (e.g., -35) to show threshold line
+AMPLITUDE_THRESHOLD = -35.0

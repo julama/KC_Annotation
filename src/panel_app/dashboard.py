@@ -15,6 +15,10 @@ import io
 import base64
 from pathlib import Path
 from colorsys import hls_to_rgb
+from scipy import signal
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+import config
 
 # Suppress HoloViews FutureWarning about pd.unique
 # This is an internal HoloViews issue when processing mixed-type data
@@ -181,6 +185,9 @@ class EEGDashboard(param.Parameterized):
         # Topoplot cache: {epoch_index: {region_id: base64_image}}
         self._topoplot_cache = {}
         self._current_epoch_for_cache = -1
+        # Cache for spectral power data (0.5-4 Hz) per epoch
+        # Maps epoch_index -> DataFrame (samples × channels) with power values
+        self._spectral_power_cache = {}
         
         # Debounce mechanism for update_trigger
         self._update_timer = None
@@ -299,6 +306,9 @@ class EEGDashboard(param.Parameterized):
             # IMPORTANT: Regions are epoch-dependent. If epoch_data changed, any cached
             # regions from the previous epoch are invalid and must be refreshed.
             self._cached_regions = None
+            
+            # Compute spectral power (0.5-4 Hz) for the entire epoch
+            self._compute_epoch_spectral_power(epoch_data)
         else:
             # Epoch_data cached, but regions need refresh
             epoch_info = self.epoch_manager.get_current_epoch_info()
@@ -641,24 +651,106 @@ class EEGDashboard(param.Parameterized):
         return result
 
     # --- TOPOPLOT GENERATION ---
+    def _compute_epoch_spectral_power(self, epoch_data: pd.DataFrame):
+        """
+        Compute spectral power (0.5-4 Hz) for the entire epoch using sliding window approach.
+        Stores power values in _spectral_power_cache[epoch_index] as DataFrame (samples × channels).
+        """
+        if epoch_data is None or len(epoch_data) == 0:
+            return
+        
+        try:
+            # Parameters for spectral power computation
+            low_freq = 0.5  # Hz
+            high_freq = 4.0  # Hz
+            window_length_sec = 2.0  # 2-second windows for power computation
+            overlap_sec = 0.5  # 1-second overlap
+            
+            sr = self.sampling_rate
+            window_length_samples = int(window_length_sec * sr)
+            overlap_samples = int(overlap_sec * sr)
+            hop_samples = window_length_samples - overlap_samples
+            
+            n_samples, n_channels = epoch_data.shape
+            power_data = np.zeros((n_samples, n_channels))
+            
+            # Compute power for each channel using sliding window
+            for ch_idx in range(n_channels):
+                channel_data = epoch_data.iloc[:, ch_idx].values
+                
+                # Use Welch's method with sliding windows
+                # For each window position, compute power in 0.5-4 Hz band
+                for start_idx in range(0, n_samples - window_length_samples + 1, hop_samples):
+                    end_idx = start_idx + window_length_samples
+                    window_data = channel_data[start_idx:end_idx]
+                    
+                    # Compute power spectral density using Welch's method
+                    freqs, psd = signal.welch(
+                        window_data,
+                        fs=sr,
+                        nperseg=min(window_length_samples, len(window_data)),
+                        noverlap=overlap_samples // 2 if overlap_samples > 0 else None
+                    )
+                    
+                    # Integrate power in 0.5-4 Hz band
+                    freq_mask = (freqs >= low_freq) & (freqs <= high_freq)
+                    if np.any(freq_mask):
+                        band_power = np.trapz(psd[freq_mask], freqs[freq_mask])
+                    else:
+                        band_power = 0.0
+                    
+                    # Assign power value to all samples in this window
+                    power_data[start_idx:end_idx, ch_idx] = band_power
+                
+                # Handle edge cases: fill samples at the beginning/end that weren't covered
+                if n_samples > 0:
+                    power_col = power_data[:, ch_idx]
+                    nonzero_mask = power_col > 0
+                    if np.any(nonzero_mask):
+                        # Forward fill from first computed value
+                        first_nonzero_idx = np.where(nonzero_mask)[0][0]
+                        if first_nonzero_idx > 0:
+                            power_data[:first_nonzero_idx, ch_idx] = power_data[first_nonzero_idx, ch_idx]
+                        
+                        # Backward fill from last computed value
+                        last_nonzero_idx = np.where(nonzero_mask)[0][-1]
+                        if last_nonzero_idx < n_samples - 1:
+                            power_data[last_nonzero_idx+1:, ch_idx] = power_data[last_nonzero_idx, ch_idx]
+            
+            # Store as DataFrame
+            power_df = pd.DataFrame(power_data, columns=epoch_data.columns, index=epoch_data.index)
+            self._spectral_power_cache[self.epoch_index] = power_df
+            
+        except Exception as e:
+            print(f"[ERROR SPECTRAL] Error computing spectral power for epoch {self.epoch_index}: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _create_topoplot_image(self, region_id: int, epoch_data: pd.DataFrame, 
                                start_idx: int, stop_idx: int) -> Optional[str]:
-        """Create base64-encoded topoplot image for a selected region."""
+        """Create base64-encoded topoplot image for a selected region using spectral power."""
         if not MNE_AVAILABLE:
             return None
         
         try:
-            # Extract data window
-            if start_idx >= len(epoch_data) or stop_idx >= len(epoch_data):
+            # Check if we have cached spectral power for this epoch
+            if self.epoch_index not in self._spectral_power_cache:
+                print(f"[WARNING TOPO] No spectral power cache for epoch {self.epoch_index}, computing now...")
+                self._compute_epoch_spectral_power(epoch_data)
+            
+            power_df = self._spectral_power_cache.get(self.epoch_index)
+            if power_df is None or len(power_df) == 0:
+                print(f"[WARNING TOPO] Empty spectral power cache for epoch {self.epoch_index}")
                 return None
-            region_data = epoch_data.iloc[start_idx:stop_idx+1].copy()
             
-            # Apply bandpass filter (0.5-2 Hz for slow waves)
-            from src.preprocessing import apply_bandpass_filter
-            filtered_data = apply_bandpass_filter(region_data, 0.5, 2.0, self.sampling_rate)
+            # Extract power values for the selected time window
+            if start_idx >= len(power_df) or stop_idx >= len(power_df):
+                return None
             
-            # Average across time window
-            mean_data = filtered_data.mean(axis=0).values
+            region_power = power_df.iloc[start_idx:stop_idx+1]
+            
+            # Average power across time window for each channel
+            mean_power = region_power.mean(axis=0).values
             
             # Get channel positions
             if not self.chanlocs.empty:
@@ -670,35 +762,35 @@ class EEGDashboard(param.Parameterized):
                     pos = np.array([-self.chanlocs['y'].values, self.chanlocs['x'].values]).T
                 else:
                     # Fallback: create circular layout
-                    n_chans = len(mean_data)
+                    n_chans = len(mean_power)
                     angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
                     pos = np.array([np.cos(angles), np.sin(angles)]).T
             else:
                 # Fallback: create circular layout
-                n_chans = len(mean_data)
+                n_chans = len(mean_power)
                 angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
                 pos = np.array([np.cos(angles), np.sin(angles)]).T
             
             # Filter out excluded channels from topoplot
             if self.exclude_channels:
-                n_chans = len(mean_data)
+                n_chans = len(mean_power)
                 # Create mask: True for channels to KEEP
                 mask = np.ones(n_chans, dtype=bool)
                 for idx in self.exclude_channels:
                     if 0 <= idx < n_chans:
                         mask[idx] = False
                 
-                mean_data = mean_data[mask]
+                mean_power = mean_power[mask]
                 pos = pos[mask]
             
-            # Create topoplot using MNE
+            # Create topoplot using MNE (showing spectral power)
             fig, ax = plt.subplots(figsize=(3, 3))
             mne.viz.plot_topomap(
-                mean_data,
+                mean_power,
                 pos,
                 axes=ax,
                 show=False,
-                cmap='RdBu_r',
+                cmap='Reds',  # Use Reds colormap for power (all positive values)
                 vlim=(None, None)
             )
             
@@ -831,6 +923,7 @@ class EEGDashboard(param.Parameterized):
             if self._current_epoch_for_cache != self.epoch_index:
                 self._topoplot_cache = {}
                 self._current_epoch_for_cache = self.epoch_index
+                # Spectral power cache is managed per epoch, no need to clear here
             
             # Cache structure for this epoch
             if self.epoch_index not in self._topoplot_cache:
@@ -1112,10 +1205,23 @@ class EEGDashboard(param.Parameterized):
                 )
             )
 
-        # Create combined plot (background spans behind curves, then regions)
+        # Add zero line and threshold line for butterfly plot
+        reference_lines = []
+        # Zero line
+        zero_line = hv.HLine(0).opts(color='gray', line_width=1, line_dash='dashed', alpha=0.5)
+        reference_lines.append(zero_line)
+        
+        # Threshold line (if configured)
+        threshold = getattr(config, 'AMPLITUDE_THRESHOLD', None)
+        if threshold is not None:
+            threshold_line = hv.HLine(threshold).opts(color='red', line_width=1, line_dash='dashed', alpha=0.7)
+            reference_lines.append(threshold_line)
+
+        # Create combined plot (background spans behind curves, then regions, then reference lines)
         elements = []
         elements.extend(vspans)
         elements.extend(curves)
+        elements.extend(reference_lines)
         combined = hv.Overlay(elements) * regions_rects
         t5 = time_module.time()
         
@@ -1364,10 +1470,28 @@ class EEGDashboard(param.Parameterized):
                 )
             )
 
-        # Create combined plot (background spans behind curves, then regions)
+        # Add zero lines and threshold lines for each channel (with offsets)
+        reference_lines = []
+        threshold = getattr(config, 'AMPLITUDE_THRESHOLD', None)
+        
+        for i_idx, channel_idx in enumerate(valid_channels):
+            offset = i_idx * offset_per_channel
+            
+            # Zero line for this channel (at offset)
+            zero_line = hv.HLine(offset).opts(color='gray', line_width=1, line_dash='dashed', alpha=0.5)
+            reference_lines.append(zero_line)
+            
+            # Threshold line for this channel (at offset + threshold)
+            if threshold is not None:
+                threshold_y = offset + threshold
+                threshold_line = hv.HLine(threshold_y).opts(color='red', line_width=1, line_dash='dashed', alpha=0.7)
+                reference_lines.append(threshold_line)
+        
+        # Create combined plot (background spans behind curves, then regions, then reference lines)
         elements = []
         elements.extend(vspans)
         elements.extend(curves)
+        elements.extend(reference_lines)
         combined = hv.Overlay(elements) * regions_rects
         # Set the range directly on the element to ensure it's preserved
         combined = combined.redim.range(y=(y_min, y_max))
