@@ -1015,6 +1015,53 @@ class EEGDashboard(param.Parameterized):
             return f'#{r:02x}{g:02x}{b:02x}'
         return '#34495e'  # Default dark gray
     
+    def _configure_hover_tool_hook(self, plot, element):
+        """Hook to ensure HoverTool only targets rectangles renderer, not HLine elements."""
+        from bokeh.models import HoverTool
+        from bokeh.models.glyphs import Quad
+        
+        if not hasattr(plot, 'state') or not hasattr(plot.state, 'tools'):
+            return
+        
+        def configure_hover():
+            # Find the HoverTool
+            hover_tool = None
+            for tool in plot.state.tools:
+                if isinstance(tool, HoverTool):
+                    hover_tool = tool
+                    break
+            
+            if hover_tool is None:
+                return
+            
+            # Find renderers that correspond to rectangles (Quad glyph)
+            # Try multiple ways to access renderers
+            all_renderers = []
+            if hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
+                all_renderers.extend(plot.handles.get('glyph_renderers') or [])
+            if hasattr(plot, 'state') and hasattr(plot.state, 'renderers'):
+                all_renderers.extend(plot.state.renderers)
+            
+            rect_renderers = []
+            for renderer in all_renderers:
+                try:
+                    if hasattr(renderer, 'glyph') and isinstance(renderer.glyph, Quad):
+                        rect_renderers.append(renderer)
+                except Exception:
+                    continue
+            
+            # Configure HoverTool to only target rectangle renderers
+            if rect_renderers:
+                hover_tool.renderers = rect_renderers
+        
+        configure_hover()
+        # Re-apply after next tick so hover tool works correctly after reload
+        if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
+            try:
+                plot.state.document.add_next_tick_callback(configure_hover)
+            except Exception:
+                pass
+    
     @param.depends('epoch_index', 'update_trigger')
     def create_main_plot(self, bounds=None, **kwargs):
         """Create butterfly plot with all channels overlaid."""
@@ -1131,15 +1178,15 @@ class EEGDashboard(param.Parameterized):
                     # First curve: enable box_select and store reference
                     first_curve = hv.Curve((tt, dd), label=f'Ch {i}').opts(
                         color=color,
-                        line_width=1,
+                        line_width=0.6,
                         alpha=0.7,
-                        tools=['box_select', 'tap', 'hover']
+                        tools=['box_select', 'tap']
                     )
                     curves.append(first_curve)
                 else:
                     curve = hv.Curve((tt, dd), label=f'Ch {i}').opts(
                         color=color,
-                        line_width=1,
+                        line_width=0.6,
                         alpha=0.7
                     )
                     curves.append(curve)
@@ -1158,23 +1205,6 @@ class EEGDashboard(param.Parameterized):
             curves = self._cached_curves
             first_curve = curves[0] if curves else None
             y_limit_min, y_limit_max = self._cached_y_range
-        
-        # Update bounds stream source to first curve for box selection
-        # Always update to ensure it's connected to the current plot
-        if first_curve is not None:
-            if not hasattr(self, '_bounds_stream') or self._bounds_stream is None:
-                # Create bounds stream if it doesn't exist
-                self._bounds_stream = streams.BoundsXY(source=first_curve)
-                self._bounds_stream.add_subscriber(self._on_box_select)
-            else:
-                # Update source to current first curve - this reconnects the stream
-                try:
-                    self._bounds_stream.source = first_curve
-                except Exception as e:
-                    # If update fails, recreate the stream
-                    print(f"Warning: Failed to update bounds stream source: {e}")
-                    self._bounds_stream = streams.BoundsXY(source=first_curve)
-                    self._bounds_stream.add_subscriber(self._on_box_select)
         
         # Dynamic y_range for butterfly plot
         y_range = (y_limit_min, y_limit_max)
@@ -1305,30 +1335,88 @@ class EEGDashboard(param.Parameterized):
             """
             from bokeh.models import BoxSelectTool
             from bokeh.models.glyphs import Line
-            
-            # Find the BoxSelectTool
-            box_select = None
-            if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
-                for tool in plot.state.tools:
-                    if isinstance(tool, BoxSelectTool):
-                        box_select = tool
-                        break
-            
-            # Restrict renderers to the first *line* renderer (skip spans/rectangles)
-            if box_select and hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
-                renderers = plot.handles['glyph_renderers']
-                if renderers:
-                    line_renderer = None
-                    for r in renderers:
+
+            def apply_box_select_renderers():
+                box_select = None
+                if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                    for tool in plot.state.tools:
+                        if isinstance(tool, BoxSelectTool):
+                            box_select = tool
+                            break
+                if not box_select:
+                    return
+                # Prefer handles (HoloViews), fallback to state.renderers (reliable after reload)
+                renderers = []
+                if hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
+                    renderers = list(plot.handles.get('glyph_renderers') or [])
+                if not renderers and hasattr(plot, 'state') and hasattr(plot.state, 'renderers'):
+                    renderers = list(plot.state.renderers)
+                if not renderers:
+                    return
+                line_renderer = None
+                for r in renderers:
+                    try:
+                        if hasattr(r, 'glyph') and isinstance(r.glyph, Line):
+                            line_renderer = r
+                            break
+                    except Exception:
+                        continue
+                if line_renderer is None:
+                    line_renderer = renderers[0]
+                box_select.renderers = [line_renderer]
+
+            apply_box_select_renderers()
+            # Re-apply after next tick so box_select has correct renderers on reload
+            # (handles can be empty when hook runs on first paint)
+            if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
+                try:
+                    plot.state.document.add_next_tick_callback(apply_box_select_renderers)
+                except Exception:
+                    pass
+
+        # Manually push BoxSelectTool overlay to stream (HoloViews link can break on reload)
+        def link_box_select_to_stream(plot, element):
+            from bokeh.models import BoxSelectTool
+            if not hasattr(self, '_bounds_stream') or self._bounds_stream is None:
+                return
+
+            def attach():
+                box_select = None
+                if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                    for tool in plot.state.tools:
+                        if isinstance(tool, BoxSelectTool):
+                            box_select = tool
+                            break
+                if not box_select or not hasattr(box_select, 'overlay') or box_select.overlay is None:
+                    return
+                stream_ref = self._bounds_stream
+
+                def push_bounds_to_stream():
+                    o = box_select.overlay
+                    left = getattr(o, 'left', None)
+                    right = getattr(o, 'right', None)
+                    top = getattr(o, 'top', None)
+                    bottom = getattr(o, 'bottom', None)
+                    if left is not None and right is not None and top is not None and bottom is not None:
+                        x0, x1 = min(left, right), max(left, right)
+                        y0, y1 = min(top, bottom), max(top, bottom)
                         try:
-                            if hasattr(r, 'glyph') and isinstance(r.glyph, Line):
-                                line_renderer = r
-                                break
+                            stream_ref.event(bounds=(x0, y0, x1, y1))
                         except Exception:
-                            continue
-                    if line_renderer is None:
-                        line_renderer = renderers[0]
-                    box_select.renderers = [line_renderer]
+                            pass
+
+                for prop in ('left', 'right', 'top', 'bottom'):
+                    try:
+                        box_select.overlay.on_change(prop, lambda a, o, n: push_bounds_to_stream())
+                    except Exception:
+                        pass
+
+            attach()
+            if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
+                try:
+                    plot.state.document.add_next_tick_callback(attach)
+                except Exception:
+                    pass
         
         # Hook to clear box selection when epoch changes
         def clear_box_selection(plot, element):
@@ -1357,12 +1445,17 @@ class EEGDashboard(param.Parameterized):
                 # Clear the flag after clearing
                 self._should_clear_box_selection = False
         
+        # X range: exact data range (0 to display_duration_s) with no extra padding
+        display_duration_s = len(display_df) / self.sampling_rate
+        
         plot_opts = opts.Overlay(
-            width=self.plot_width, height=self.plot_height, shared_axes=True, show_legend=False, 
-            tools=['tap', 'hover', 'xwheel_zoom', 'xpan','box_select'], 
+            height=self.plot_height, shared_axes=True, show_legend=False, 
+            responsive=True,  # Make plot responsive to container width
+            tools=['tap', 'xwheel_zoom', 'xpan','box_select'], 
             active_tools=['tap', 'box_select'],
-            hooks=[set_y_range, lock_y_range, clear_box_selection, ensure_box_select, optimize_selection],
+            hooks=[set_y_range, lock_y_range, clear_box_selection, ensure_box_select, optimize_selection, link_box_select_to_stream, self._configure_hover_tool_hook],
             ylim=(butterfly_y_min, butterfly_y_max),  # Explicitly set ylim to prevent auto-scaling - BUTTERFLY PLOT ONLY
+            xlim=(0, display_duration_s),  # No white space before 0 or after display end
             framewise=False,  # Prevent auto-scaling on updates
         )
         
@@ -1425,13 +1518,13 @@ class EEGDashboard(param.Parameterized):
             # Create curve with explicit y-range to prevent auto-scaling
             curve_opts = {
                 'color': color,
-                'line_width': 1.5,
+                'line_width': 0.8,
                 'alpha': 0.8,
             }
             
             if i_idx == 0:
                 # First curve: enable box_select and store reference
-                curve_opts['tools'] = ['box_select', 'tap', 'hover']
+                curve_opts['tools'] = ['box_select', 'tap']
                 first_curve = hv.Curve((tt, dd), label=f'Ch {channel_idx}').opts(**curve_opts)
                 curves.append(first_curve)
             else:
@@ -1478,13 +1571,13 @@ class EEGDashboard(param.Parameterized):
             offset = i_idx * offset_per_channel
             
             # Zero line for this channel (at offset)
-            zero_line = hv.HLine(offset).opts(color='gray', line_width=1, line_dash='dashed', alpha=0.5)
+            zero_line = hv.HLine(offset).opts(color='gray', line_width=0.7, line_dash='solid', alpha=0.5)
             reference_lines.append(zero_line)
             
             # Threshold line for this channel (at offset + threshold)
             if threshold is not None:
                 threshold_y = offset + threshold
-                threshold_line = hv.HLine(threshold_y).opts(color='red', line_width=1, line_dash='dashed', alpha=0.7)
+                threshold_line = hv.HLine(threshold_y).opts(color='red', line_width=0.7, line_dash='solid', alpha=0.7)
                 reference_lines.append(threshold_line)
         
         # Create combined plot (background spans behind curves, then regions, then reference lines)
@@ -1496,20 +1589,6 @@ class EEGDashboard(param.Parameterized):
         # Set the range directly on the element to ensure it's preserved
         combined = combined.redim.range(y=(y_min, y_max))
         t4 = time_module.time()
-        
-        # Update bounds stream source to first curve for box selection
-        # Do this in a hook to avoid triggering plot recreation during creation
-        def update_bounds_stream(plot, element):
-            """Update bounds stream source after plot is created"""
-            if first_curve is not None and hasattr(self, '_bounds_stream_focus') and self._bounds_stream_focus is not None:
-                try:
-                    # Use the HoloViews element as the stream source (stable even with background spans)
-                    self._bounds_stream_focus.source = first_curve
-                except Exception as e:
-                    print(f"Warning: Failed to update focus bounds stream source: {e}")
-        
-        # Store the update function to be called in hooks
-        update_bounds_stream_fn = update_bounds_stream
         
         # Hook to set y-axis range dynamically and prevent auto-scaling
         # Use local variables to ensure this plot's range is independent from butterfly plot
@@ -1621,29 +1700,85 @@ class EEGDashboard(param.Parameterized):
             """Hook to restrict BoxSelectTool to only the first renderer."""
             from bokeh.models import BoxSelectTool
             from bokeh.models.glyphs import Line
-            
-            box_select = None
-            if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
-                for tool in plot.state.tools:
-                    if isinstance(tool, BoxSelectTool):
-                        box_select = tool
-                        break
-            
-            if box_select and hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
-                renderers = plot.handles['glyph_renderers']
-                if renderers:
-                    # Choose the first *line* renderer (skip spans/rectangles)
-                    line_renderer = None
-                    for r in renderers:
+
+            def apply_box_select_renderers():
+                box_select = None
+                if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                    for tool in plot.state.tools:
+                        if isinstance(tool, BoxSelectTool):
+                            box_select = tool
+                            break
+                if not box_select:
+                    return
+                renderers = []
+                if hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
+                    renderers = list(plot.handles.get('glyph_renderers') or [])
+                if not renderers and hasattr(plot, 'state') and hasattr(plot.state, 'renderers'):
+                    renderers = list(plot.state.renderers)
+                if not renderers:
+                    return
+                line_renderer = None
+                for r in renderers:
+                    try:
+                        if hasattr(r, 'glyph') and isinstance(r.glyph, Line):
+                            line_renderer = r
+                            break
+                    except Exception:
+                        continue
+                if line_renderer is None:
+                    line_renderer = renderers[0]
+                box_select.renderers = [line_renderer]
+
+            apply_box_select_renderers()
+            if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
+                try:
+                    plot.state.document.add_next_tick_callback(apply_box_select_renderers)
+                except Exception:
+                    pass
+
+        # Manually push BoxSelectTool overlay to stream (HoloViews link can break on reload)
+        def link_box_select_to_stream_focus(plot, element):
+            from bokeh.models import BoxSelectTool
+            if not hasattr(self, '_bounds_stream_focus') or self._bounds_stream_focus is None:
+                return
+
+            def attach():
+                box_select = None
+                if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
+                    for tool in plot.state.tools:
+                        if isinstance(tool, BoxSelectTool):
+                            box_select = tool
+                            break
+                if not box_select or not hasattr(box_select, 'overlay') or box_select.overlay is None:
+                    return
+                stream_ref = self._bounds_stream_focus
+
+                def push_bounds_to_stream():
+                    o = box_select.overlay
+                    left = getattr(o, 'left', None)
+                    right = getattr(o, 'right', None)
+                    top = getattr(o, 'top', None)
+                    bottom = getattr(o, 'bottom', None)
+                    if left is not None and right is not None and top is not None and bottom is not None:
+                        x0, x1 = min(left, right), max(left, right)
+                        y0, y1 = min(top, bottom), max(top, bottom)
                         try:
-                            if hasattr(r, 'glyph') and isinstance(r.glyph, Line):
-                                line_renderer = r
-                                break
+                            stream_ref.event(bounds=(x0, y0, x1, y1))
                         except Exception:
-                            continue
-                    if line_renderer is None:
-                        line_renderer = renderers[0]
-                    box_select.renderers = [line_renderer]
+                            pass
+
+                for prop in ('left', 'right', 'top', 'bottom'):
+                    try:
+                        box_select.overlay.on_change(prop, lambda a, o, n: push_bounds_to_stream())
+                    except Exception:
+                        pass
+
+            attach()
+            if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
+                try:
+                    plot.state.document.add_next_tick_callback(attach)
+                except Exception:
+                    pass
         
         # Hook to clear box selection when epoch changes - 3-CHANNEL PLOT
         def clear_box_selection_focus(plot, element):
@@ -1673,14 +1808,19 @@ class EEGDashboard(param.Parameterized):
                 self._should_clear_box_selection_focus = False
         
         # Build hooks list - ensure bounds stream update happens after range is set
-        hooks_list = [set_y_range, lock_y_range, clear_box_selection_focus, update_bounds_stream_fn, ensure_box_select, optimize_selection]
+        hooks_list = [set_y_range, lock_y_range, clear_box_selection_focus, ensure_box_select, optimize_selection, link_box_select_to_stream_focus, self._configure_hover_tool_hook]
+        
+        # X range: exact data range (0 to display_duration_s) with no extra padding
+        display_duration_s = len(display_df) / self.sampling_rate
         
         plot_opts = opts.Overlay(
-            width=self.plot_width, height=self.plot_height, shared_axes=True, show_legend=False,
-            tools=['tap', 'hover', 'xwheel_zoom', 'xpan', 'box_select'],
+            height=self.plot_height, shared_axes=True, show_legend=False,
+            responsive=True,  # Make plot responsive to container width
+            tools=['tap', 'xwheel_zoom', 'xpan', 'box_select'],
             active_tools=['tap', 'box_select'],
             hooks=hooks_list,
             ylim=(focus_y_min, focus_y_max),  # Explicitly set ylim to prevent auto-scaling - 3-CHANNEL PLOT ONLY
+            xlim=(0, display_duration_s),  # No white space before 0 or after display end
             framewise=False,  # Critical: prevent auto-scaling on updates
         )
         
@@ -1722,7 +1862,7 @@ class EEGDashboard(param.Parameterized):
         color = self._get_channel_color(channel_idx)
         # Use fixed y_range of -200 to +200 for focus plots
         y_range = (-200, 200)
-        curve = hv.Curve((tt, dd)).opts(color=color, line_width=1.5)
+        curve = hv.Curve((tt, dd)).opts(color=color, line_width=1)
         regions_rects = self._create_selected_regions(current_regions, y_range, epoch_data)
         
         # Hook to set y-axis range
@@ -1807,21 +1947,17 @@ class EEGDashboard(param.Parameterized):
         .bk-btn-group .bk-btn:nth-child(2) { background-color: #95a5a6 !important; color: white !important; }
         </style>""")
 
-        # Create bounds stream for box selection - source will be set in create_focus_channels_plot
-        # Initialize it here but source will be updated when plot is created
+        # Create bounds streams for box selection without source (HoloViews will auto-link to plots)
         if not hasattr(self, '_bounds_stream_focus') or self._bounds_stream_focus is None:
             self._bounds_stream_focus = streams.BoundsXY()
             self._bounds_stream_focus.add_subscriber(self._on_box_select)
         
-        # Create bounds stream for butterfly plot (main plot)
         if not hasattr(self, '_bounds_stream') or self._bounds_stream is None:
             self._bounds_stream = streams.BoundsXY()
             self._bounds_stream.add_subscriber(self._on_box_select)
         
-        # Create focus channels plot (stacked 3 channels) with tap and bounds streams
+        # Create DynamicMaps with streams - HoloViews will automatically link BoundsXY to the plots
         focus_channels_dmap = hv.DynamicMap(self.create_focus_channels_plot, streams=[self.tap_stream, self._bounds_stream_focus])
-        
-        # Create main plot (butterfly) with both tap and bounds streams
         main_dmap = hv.DynamicMap(self.create_main_plot, streams=[self.tap_stream, self._bounds_stream])
         
         # Compact layout with controls in a single row

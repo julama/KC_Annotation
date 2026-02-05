@@ -1,10 +1,14 @@
-"""Configuration parameters for the EEG annotation tool"""
+"""Configuration parameters for the EEG annotation tool
+
+python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
+
+"""
 
 # Epoch parameters
 EPOCH_LENGTH_SECONDS = 20.0
 
 # Default channel indices to display individually (0-based)
-DEFAULT_CHANNEL_INDICES = [10, 5, 54]
+DEFAULT_CHANNEL_INDICES = [10, 54, 74] #Fz, 6, Pz
 
 # Slow Wave filter parameters
 SW_FILTER_LOW = 0.5  # Hz
@@ -35,7 +39,7 @@ MAIN_PLOT_CHANNELS = [
 # - 'average': Use average of all channels
 # - List[int]: Use average of specific channel indices (0-based, e.g., [48, 55] for mastoids)
 # - None: No re-referencing
-REFERENCE = [48, 55]
+REFERENCE = [56, 99]
 
 # Threshold line for amplitude visualization
 # Set to None to disable threshold lines, or a numeric value (e.g., -35) to show threshold line
