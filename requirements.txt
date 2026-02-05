@@ -1,17 +1,17 @@
 # Core data processing
 numpy>=1.23.0
-pandas>=1.5.0
+pandas>=1.6.0
 scipy>=1.9.0
 
 # EEG processing
 mne>=1.0.0
 
 # Machine learning (for future KC detection)
-scikit-learn>=1.0.0
+#scikit-learn>=1.0.0
 
 # Original Dash implementation (optional, for backwards compatibility)
-plotly>=5.0.0
-dash>=2.0.0
+#plotly>=5.0.0
+#dash>=2.0.0
 
 # Panel + HoloViews implementation (recommended)
 panel>=1.3.0

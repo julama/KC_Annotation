@@ -1020,19 +1020,29 @@ class EEGDashboard(param.Parameterized):
         rects = hv.Rectangles(df_rects, kdims=['x0','y0','x1','y1'], 
                              vdims=['region_id','status','fill_color','line_color','line_width','alpha','topo_html','rel_start','rel_stop'])
         
-        # Create hover tool - topoplots will be generated on-demand via hook
-        hover = self._create_hover_tool_with_callback(epoch_data)
+        # Store epoch_data for hover tool callback
+        if epoch_data is not None:
+            if not hasattr(self, '_hover_epoch_data'):
+                self._hover_epoch_data = {}
+            self._hover_epoch_data[self.epoch_index] = epoch_data
         
+        print(f"[HOVER DEBUG] _create_selected_regions: Creating {len(df_rects)} rectangles for hover tool hook")
+        
+        # Note: HoverTool will be created/configured by the _configure_hover_tool_hook
+        # Note: clone=False ensures each Rectangles element is unique (not cached by HoloViews)
+        # Note: We include 'hover' in tools to force HoloViews to include extra columns (like topo_html)
+        #       in the data source, even though we might replace/configure the actual tool in the hook.
         return rects.opts(
             color='fill_color', 
             line_color='line_color', 
             line_width='line_width', 
             alpha='alpha', 
-            tools=[hover, 'tap'],
+            tools=['hover', 'tap'],  # 'hover' ensures columns are preserved
             nonselection_alpha='alpha',
             nonselection_line_alpha=0.9,
             nonselection_color='fill_color',
-            nonselection_line_color='line_color'
+            nonselection_line_color='line_color',
+            clone=False  # Prevent HoloViews from caching this element
         )
 
     # === CHANGE DEFAULT CHANNEL COLOR ===
@@ -1044,51 +1054,80 @@ class EEGDashboard(param.Parameterized):
         return '#34495e'  # Default dark gray - change this for default EEG color
     
     def _configure_hover_tool_hook(self, plot, element):
-        """Hook to ensure HoverTool only targets rectangles renderer, not HLine elements."""
+        """Create and configure HoverTool for topoplot tooltips on rectangle renderers."""
         from bokeh.models import HoverTool
         from bokeh.models.glyphs import Quad
         
-        if not hasattr(plot, 'state') or not hasattr(plot.state, 'tools'):
+        # print(f"[HOVER DEBUG] _configure_hover_tool_hook CALLED for plot {id(plot)}")
+        
+        if not hasattr(plot, 'state'):
+            # print(f"[HOVER DEBUG] Hook: No plot.state")
             return
         
-        def configure_hover():
-            # Find the HoverTool
-            hover_tool = None
-            for tool in plot.state.tools:
-                if isinstance(tool, HoverTool):
-                    hover_tool = tool
-                    break
-            
-            if hover_tool is None:
-                return
-            
-            # Find renderers that correspond to rectangles (Quad glyph)
-            # Try multiple ways to access renderers
-            all_renderers = []
-            if hasattr(plot, 'handles') and 'glyph_renderers' in plot.handles:
-                all_renderers.extend(plot.handles.get('glyph_renderers') or [])
-            if hasattr(plot, 'state') and hasattr(plot.state, 'renderers'):
-                all_renderers.extend(plot.state.renderers)
-            
+        def configure():
+            """Find Quad renderers and create/update HoverTool for them"""
+            # Find Quad (rectangle) renderers
             rect_renderers = []
-            for renderer in all_renderers:
-                try:
-                    if hasattr(renderer, 'glyph') and isinstance(renderer.glyph, Quad):
-                        rect_renderers.append(renderer)
-                except Exception:
-                    continue
+            renderer_types = []
+            if hasattr(plot.state, 'renderers'):
+                for renderer in plot.state.renderers:
+                    if hasattr(renderer, 'glyph'):
+                        renderer_types.append(type(renderer.glyph).__name__)
+                        if isinstance(renderer.glyph, Quad):
+                            rect_renderers.append(renderer)
             
-            # Configure HoverTool to only target rectangle renderers
-            if rect_renderers:
+            if not rect_renderers:
+                # print(f"[HOVER DEBUG] Hook: No Quad renderers yet. Found: {renderer_types}")
+                return False
+            
+            # Find existing HoverTool for rectangles or create a new one
+            hover_tool = None
+            if hasattr(plot.state, 'tools'):
+                for tool in plot.state.tools:
+                    if isinstance(tool, HoverTool):
+                        hover_tool = tool
+                        break
+            
+            if hover_tool:
+                # Update existing HoverTool to point to current rectangle renderers and ensure tooltips are correct
                 hover_tool.renderers = rect_renderers
+                hover_tool.tooltips = """
+                    <div style="font-size: 12px;">
+                        <strong>Region @region_id</strong><br>
+                        Status: @status<br>
+                        Time: @x0{0.00}s - @x1{0.00}s<br>
+                        @topo_html{safe}
+                    </div>
+                """
+                # print(f"[HOVER DEBUG] Hook SUCCESS: Updated HoverTool for {len(rect_renderers)} Quad renderers (plot {id(plot)})")
+            else:
+                # Create a new HoverTool specifically for rectangles
+                hover_tool = HoverTool(
+                    tooltips="""
+                        <div style="font-size: 12px;">
+                            <strong>Region @region_id</strong><br>
+                            Status: @status<br>
+                            Time: @x0{0.00}s - @x1{0.00}s<br>
+                            @topo_html{safe}
+                        </div>
+                    """,
+                    renderers=rect_renderers,
+                    point_policy='follow_mouse',
+                    attachment='above'
+                )
+                plot.state.add_tools(hover_tool)
+                # print(f"[HOVER DEBUG] Hook SUCCESS: Added HoverTool for {len(rect_renderers)} Quad renderers (plot {id(plot)})")
+            
+            return True
         
-        configure_hover()
-        # Re-apply after next tick so hover tool works correctly after reload
-        if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
-            try:
-                plot.state.document.add_next_tick_callback(configure_hover)
-            except Exception:
-                pass
+        # Try immediately
+        if configure():
+            return
+        
+        # If failed, retry on next tick
+        # print(f"[HOVER DEBUG] Hook: First attempt failed, scheduling retry")
+        if hasattr(plot.state, 'document') and plot.state.document:
+            plot.state.document.add_next_tick_callback(lambda: configure())
     
     @param.depends('epoch_index', 'update_trigger')
     def create_main_plot(self, bounds=None, **kwargs):
@@ -1481,10 +1520,13 @@ class EEGDashboard(param.Parameterized):
         # X range: exact data range (0 to display_duration_s) with no extra padding
         display_duration_s = len(display_df) / self.sampling_rate
         
+        # Build tools list
+        tools_list = ['tap', 'xwheel_zoom', 'xpan', 'box_select']
+        
         plot_opts = opts.Overlay(
             height=self.plot_height, shared_axes=True, show_legend=False, 
             responsive=True,  # Make plot responsive to container width
-            tools=['tap', 'xwheel_zoom', 'xpan','box_select'], 
+            tools=tools_list, 
             active_tools=['tap', 'box_select'],
             hooks=[set_y_range, lock_y_range, clear_box_selection, ensure_box_select, optimize_selection, link_box_select_to_stream, self._configure_hover_tool_hook],
             ylim=(butterfly_y_min, butterfly_y_max),  # Explicitly set ylim to prevent auto-scaling - BUTTERFLY PLOT ONLY
@@ -1532,7 +1574,8 @@ class EEGDashboard(param.Parameterized):
         curves = []
         first_curve = None
         offset_per_channel = 500  # Vertical spacing between channels
-        channel_range = 230  # Match butterfly range: -230..230 per channel
+        # === CHANGE Y-AXIS SCALE (3-CHANNEL PLOT) ===
+        channel_range = 200  # Y-axis range per channel: -200..200
         
         for i_idx, channel_idx in enumerate(valid_channels):
             col = display_df.columns[channel_idx]
@@ -1611,12 +1654,16 @@ class EEGDashboard(param.Parameterized):
             zero_line = hv.HLine(offset).opts(color='gray', line_width=0.7, line_dash='solid', alpha=0.5)
             reference_lines.append(zero_line)
             
-            # Threshold line for this channel (if configured in config.py AMPLITUDE_THRESHOLD)
+            # Threshold lines for this channel (if configured in config.py AMPLITUDE_THRESHOLD)
             if threshold is not None:
-                threshold_y = offset + threshold
-                # Threshold line - modify color, line_width, line_dash, alpha
-                threshold_line = hv.HLine(threshold_y).opts(color='red', line_width=0.7, line_dash='solid', alpha=0.7)
-                reference_lines.append(threshold_line)
+                # Negative threshold line (e.g., -35)
+                threshold_neg_y = offset + threshold
+                threshold_neg_line = hv.HLine(threshold_neg_y).opts(color='gray', line_width=0.7, line_dash='solid', alpha=0.5)
+                reference_lines.append(threshold_neg_line)
+                # Positive threshold line (e.g., +35)
+                threshold_pos_y = offset - threshold  # threshold is negative, so -threshold gives positive
+                threshold_pos_line = hv.HLine(threshold_pos_y).opts(color='gray', line_width=0.7, line_dash='solid', alpha=0.5)
+                reference_lines.append(threshold_pos_line)
         
         # Create combined plot (background spans behind curves, then regions, then reference lines)
         elements = []
@@ -1645,10 +1692,28 @@ class EEGDashboard(param.Parameterized):
                         ticks.append(base + v)
 
                 plot.state.yaxis[0].ticker = FixedTicker(ticks=ticks)
+                
+                # Get channel names from config (reversed to match display order: top to bottom)
+                ch_names = getattr(config, 'CH_NAMES', None)
+                if ch_names and len(ch_names) >= len(valid_channels):
+                    # Reverse to match: i_stack=0 is bottom (last config entry), i_stack=N-1 is top (first config entry)
+                    ch_names_reversed = list(reversed(ch_names[:len(valid_channels)]))
+                    ch_names_js = str(ch_names_reversed)  # Convert to JS array string
+                else:
+                    ch_names_js = "null"
+                
+                # === CHANGE CHANNEL NAMES (3-CHANNEL PLOT Y-AXIS) ===
                 plot.state.yaxis[0].formatter = FuncTickFormatter(code=f"""
                     const offset = {offset_per_channel};
-                    let v = tick - Math.floor(tick/offset)*offset;
-                    if (v > offset/2) v -= offset;
+                    const ch_names = {ch_names_js};
+                    const n_channels = {len(valid_channels)};
+                    let i_stack = Math.floor(tick / offset);
+                    let v = tick - i_stack * offset;
+                    if (v > offset/2) {{ v -= offset; i_stack += 1; }}
+                    // At zero line, show channel name
+                    if (Math.abs(v) < 1 && ch_names && i_stack >= 0 && i_stack < n_channels) {{
+                        return ch_names[i_stack] + ": 0";
+                    }}
                     return v.toFixed(0);
                 """)
                 plot.state.yaxis[0].axis_label = "Amplitude (normalized)"
@@ -1851,10 +1916,16 @@ class EEGDashboard(param.Parameterized):
         # X range: exact data range (0 to display_duration_s) with no extra padding
         display_duration_s = len(display_df) / self.sampling_rate
         
+        # === CHANGE Y-AXIS SCALE (3-CHANNEL PLOT HEIGHT) ===
+        focus_plot_height = int(self.plot_height * 1.5)  # Scale height by 1.5x
+        
+        # Build tools list
+        focus_tools_list = ['tap', 'xwheel_zoom', 'xpan', 'box_select']
+        
         plot_opts = opts.Overlay(
-            height=self.plot_height, shared_axes=True, show_legend=False,
+            height=focus_plot_height, shared_axes=True, show_legend=False,
             responsive=True,  # Make plot responsive to container width
-            tools=['tap', 'xwheel_zoom', 'xpan', 'box_select'],
+            tools=focus_tools_list,
             active_tools=['tap', 'box_select'],
             hooks=hooks_list,
             ylim=(focus_y_min, focus_y_max),  # Explicitly set ylim to prevent auto-scaling - 3-CHANNEL PLOT ONLY

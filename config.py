@@ -9,10 +9,11 @@ EPOCH_LENGTH_SECONDS = 20.0
 
 # Default channel indices to display individually (0-based)
 DEFAULT_CHANNEL_INDICES = [14, 10, 54] #Fz, 6, Pz
+CH_NAMES = ['FPz', 'Fz', '55']
 
 # Slow Wave filter parameters
 SW_FILTER_LOW = 0.5  # Hz
-SW_FILTER_HIGH = 18.0  # Hz
+SW_FILTER_HIGH =30.0  # Hz
 
 # Default sleep stages to analyze
 DEFAULT_SLEEP_STAGES = [-2]#[1, 0, -1, -2, -3]
