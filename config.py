@@ -8,7 +8,7 @@ python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_Fil
 EPOCH_LENGTH_SECONDS = 20.0
 
 # Default channel indices to display individually (0-based)
-DEFAULT_CHANNEL_INDICES = [10, 54, 74] #Fz, 6, Pz
+DEFAULT_CHANNEL_INDICES = [14, 10, 54] #Fz, 6, Pz
 
 # Slow Wave filter parameters
 SW_FILTER_LOW = 0.5  # Hz

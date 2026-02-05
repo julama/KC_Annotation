@@ -36,16 +36,19 @@ pn.extension('tabulator', sizing_mode='stretch_width')
 hv.extension('bokeh')
 
 # --- CONFIGURATION ---
+# === CHANGE ANNOTATION COLORS ===
+# Modify these to change the color of annotated regions
 ANNOTATION_COLORS = {
-    'unannotated': '#95a5a6',  # Gray
-    'KC': '#27ae60',           # Green  
+    'unannotated': '#95a5a6',  # Gray - color for unannotated regions
+    'KC': '#27ae60',           # Green - color for KC-labeled regions
 }
 
+# === CHANGE CONTEXT DISPLAY SETTINGS ===
 # Display settings: show extra context around each epoch
 # Epoch progression/hop remains controlled by EpochManager.epoch_length_sec (e.g. 20s).
-DISPLAY_CONTEXT_BEFORE_SEC = 5.0
-DISPLAY_CONTEXT_AFTER_SEC = 5.0
-CONTEXT_BACKGROUND_COLOR = '#cfe8ff'  # light blue
+DISPLAY_CONTEXT_BEFORE_SEC = 5.0   # Seconds of context shown before epoch
+DISPLAY_CONTEXT_AFTER_SEC = 5.0    # Seconds of context shown after epoch
+CONTEXT_BACKGROUND_COLOR = '#cfe8ff'  # Light blue - background color for context regions
 
 def downsample_minmax(data: np.ndarray, time: np.ndarray, max_points: int = 4000) -> tuple:
     n = len(data)
@@ -771,7 +774,16 @@ class EEGDashboard(param.Parameterized):
                 angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
                 pos = np.array([np.cos(angles), np.sin(angles)]).T
             
+            # Normalize positions to fit within unit circle (MNE expects positions roughly in -1 to 1 range)
+            # This ensures the head outline matches the electrode positions
+            pos_original = pos.copy()  # Keep original for focus channel markers
+            max_radius = np.max(np.sqrt(pos[:, 0]**2 + pos[:, 1]**2))
+            if max_radius > 0:
+                pos = pos / max_radius * 0.9  # Scale to 90% of unit circle
+            
             # Filter out excluded channels from topoplot
+            # Track which indices are kept for focus channel marking
+            kept_indices = np.arange(len(mean_power))
             if self.exclude_channels:
                 n_chans = len(mean_power)
                 # Create mask: True for channels to KEEP
@@ -782,6 +794,8 @@ class EEGDashboard(param.Parameterized):
                 
                 mean_power = mean_power[mask]
                 pos = pos[mask]
+                pos_original = pos_original[mask]
+                kept_indices = kept_indices[mask]
             
             # Create topoplot using MNE (showing spectral power)
             fig, ax = plt.subplots(figsize=(3, 3))
@@ -793,6 +807,17 @@ class EEGDashboard(param.Parameterized):
                 cmap='Reds',  # Use Reds colormap for power (all positive values)
                 vlim=(None, None)
             )
+            
+            # Mark the 3 focus channels on the topoplot
+            if self.focus_channels:
+                for focus_ch in self.focus_channels:
+                    # Find where this channel is in the kept_indices
+                    match_idx = np.where(kept_indices == focus_ch)[0]
+                    if len(match_idx) > 0:
+                        idx = match_idx[0]
+                        # Plot marker at this position
+                        ax.plot(pos[idx, 0], pos[idx, 1], 'ko', markersize=8, markerfacecolor='none', markeredgewidth=2)
+                        ax.plot(pos[idx, 0], pos[idx, 1], 'k+', markersize=6, markeredgewidth=1.5)
             
             # Convert to base64 image
             buf = io.BytesIO()
@@ -948,6 +973,7 @@ class EEGDashboard(param.Parameterized):
             status = self.annotation_manager.get_annotation_status(region_id)
             is_sel = (region_id == self.selected_region_id)
             
+            # === CHANGE REGION SELECTION STYLING ===
             # Color scheme: show label color even when selected, with brighter yellow outline
             if status == 'KC':
                 fill = ANNOTATION_COLORS['KC']
@@ -957,14 +983,15 @@ class EEGDashboard(param.Parameterized):
                 base_lc = ANNOTATION_COLORS['unannotated']
             
             if is_sel:
-                # When selected: use label color for fill, bright yellow for outline
-                lc = '#FFD700'  # Bright gold/yellow outline
-                lw = 4  # Thicker border when selected
-                alpha = 0.25  # Slightly more visible when selected
+                # Selected region styling - modify lc (outline color), lw (line width), alpha
+                lc = '#FFD700'  # Bright gold/yellow outline when selected
+                lw = 4          # Thicker border when selected
+                alpha = 0.25    # Slightly more visible when selected
             else:
+                # Non-selected region styling
                 lc = base_lc
-                lw = 2
-                alpha = 0.15  # Transparent so EEG shows through
+                lw = 2          # Border thickness when not selected
+                alpha = 0.15    # Transparent so EEG shows through
             
             # Convert sample indices to time, shifting by time_offset_seconds (e.g. pre-context)
             start_time = (rel_start / self.sampling_rate) + time_offset_seconds
@@ -1008,12 +1035,13 @@ class EEGDashboard(param.Parameterized):
             nonselection_line_color='line_color'
         )
 
+    # === CHANGE DEFAULT CHANNEL COLOR ===
     def _get_channel_color(self, channel_idx: int) -> str:
         """Get color for a channel, using channel colors if available."""
         if channel_idx in self.channel_colors:
             r, g, b = self.channel_colors[channel_idx]
             return f'#{r:02x}{g:02x}{b:02x}'
-        return '#34495e'  # Default dark gray
+        return '#34495e'  # Default dark gray - change this for default EEG color
     
     def _configure_hover_tool_hook(self, plot, element):
         """Hook to ensure HoverTool only targets rectangles renderer, not HLine elements."""
@@ -1174,27 +1202,30 @@ class EEGDashboard(param.Parameterized):
                 tt, dd = downsample_minmax(d_normalized, t)
                 color = self._get_channel_color(i)
                 
+                # === CHANGE EEG LINES (BUTTERFLY PLOT) ===
+                # Modify line_width, alpha, color below to change EEG curve appearance
                 if i_idx == 0:
                     # First curve: enable box_select and store reference
                     first_curve = hv.Curve((tt, dd), label=f'Ch {i}').opts(
                         color=color,
-                        line_width=0.6,
-                        alpha=0.7,
+                        line_width=0.6,      # EEG line thickness (butterfly)
+                        alpha=0.7,           # EEG line transparency (butterfly)
                         tools=['box_select', 'tap']
                     )
                     curves.append(first_curve)
                 else:
                     curve = hv.Curve((tt, dd), label=f'Ch {i}').opts(
                         color=color,
-                        line_width=0.6,
-                        alpha=0.7
+                        line_width=0.6,      # EEG line thickness (butterfly)
+                        alpha=0.7            # EEG line transparency (butterfly)
                     )
                     curves.append(curve)
             
+            # === CHANGE Y-AXIS RANGE (BUTTERFLY PLOT) ===
             # Use fixed range for butterfly plot (requested: ~-230 to +230)
             # The normalized data is already scaled to ~30 units, so we use a fixed range
-            y_limit_min = -230
-            y_limit_max = 230
+            y_limit_min = -230   # Y-axis minimum (butterfly)
+            y_limit_max = 230    # Y-axis maximum (butterfly)
             
             # Cache curves and epoch index
             self._cached_curves = curves
@@ -1235,15 +1266,17 @@ class EEGDashboard(param.Parameterized):
                 )
             )
 
+        # === CHANGE REFERENCE LINES (BUTTERFLY PLOT) ===
         # Add zero line and threshold line for butterfly plot
         reference_lines = []
-        # Zero line
+        # Zero line - modify color, line_width, line_dash, alpha
         zero_line = hv.HLine(0).opts(color='gray', line_width=1, line_dash='dashed', alpha=0.5)
         reference_lines.append(zero_line)
         
-        # Threshold line (if configured)
+        # Threshold line (if configured in config.py AMPLITUDE_THRESHOLD)
         threshold = getattr(config, 'AMPLITUDE_THRESHOLD', None)
         if threshold is not None:
+            # Threshold line - modify color, line_width, line_dash, alpha
             threshold_line = hv.HLine(threshold).opts(color='red', line_width=1, line_dash='dashed', alpha=0.7)
             reference_lines.append(threshold_line)
 
@@ -1508,18 +1541,20 @@ class EEGDashboard(param.Parameterized):
             # Normalize channel similar to butterfly plot (scale to ~30 units)
             d_normalized = (d - np.mean(d)) / (np.std(d) or 1) * 30
             
-            # Apply vertical offset: channel 0 at 0, channel 1 at +500, channel 2 at +1000
-            offset = i_idx * offset_per_channel
+            # Apply vertical offset: first channel (i_idx=0) at TOP, last channel at BOTTOM
+            # This ensures config order [Fz, 6, Pz] displays as Fz on top, Pz at bottom
+            offset = (len(valid_channels) - 1 - i_idx) * offset_per_channel
             d_offset = d_normalized + offset
             
             tt, dd = downsample_minmax(d_offset, t)
             color = self._get_channel_color(channel_idx)
             
+            # === CHANGE EEG LINES (3-CHANNEL STACKED PLOT) ===
             # Create curve with explicit y-range to prevent auto-scaling
             curve_opts = {
                 'color': color,
-                'line_width': 0.8,
-                'alpha': 0.8,
+                'line_width': 0.5,   # EEG line thickness (3-channel)
+                'alpha': 1,        # EEG line transparency (3-channel)
             }
             
             if i_idx == 0:
@@ -1563,20 +1598,23 @@ class EEGDashboard(param.Parameterized):
                 )
             )
 
+        # === CHANGE REFERENCE LINES (3-CHANNEL STACKED PLOT) ===
         # Add zero lines and threshold lines for each channel (with offsets)
         reference_lines = []
         threshold = getattr(config, 'AMPLITUDE_THRESHOLD', None)
         
         for i_idx, channel_idx in enumerate(valid_channels):
-            offset = i_idx * offset_per_channel
+            # Match curve offset: first channel at TOP, last at BOTTOM
+            offset = (len(valid_channels) - 1 - i_idx) * offset_per_channel
             
-            # Zero line for this channel (at offset)
+            # Zero line for this channel - modify color, line_width, line_dash, alpha
             zero_line = hv.HLine(offset).opts(color='gray', line_width=0.7, line_dash='solid', alpha=0.5)
             reference_lines.append(zero_line)
             
-            # Threshold line for this channel (at offset + threshold)
+            # Threshold line for this channel (if configured in config.py AMPLITUDE_THRESHOLD)
             if threshold is not None:
                 threshold_y = offset + threshold
+                # Threshold line - modify color, line_width, line_dash, alpha
                 threshold_line = hv.HLine(threshold_y).opts(color='red', line_width=0.7, line_dash='solid', alpha=0.7)
                 reference_lines.append(threshold_line)
         
