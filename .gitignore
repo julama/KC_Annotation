@@ -1,5 +1,6 @@
-# Data folder
-Data/
+# Data folder - ignore contents but keep channels.csv
+Data/*
+!Data/channels.csv
 
 #build files
 build/
