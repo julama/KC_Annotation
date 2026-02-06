@@ -19,8 +19,8 @@ if %errorlevel% neq 0 (
         exit /b 1
     )
     
-    echo Installing Python 3.11 via winget...
-    winget install Python.Python.3.11 --accept-package-agreements --accept-source-agreements
+    echo Installing Python 3.11 via winget (user install, no admin needed)...
+    winget install Python.Python.3.11 --scope user --accept-package-agreements --accept-source-agreements
     
     if %errorlevel% neq 0 (
         echo ERROR: Failed to install Python.
