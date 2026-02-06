@@ -1,6 +1,10 @@
 # Data folder
 Data/
 
+#build files
+build/
+dist/
+
 # Python
 __pycache__/
 *.py[cod]
