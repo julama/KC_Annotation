@@ -7,9 +7,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -26,6 +24,13 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# PyInstaller
+build/
+dist/
+*.spec.bak
+*.manifest
+*.exe
+
 # Virtual environments
 venv/
 env/
@@ -38,7 +43,6 @@ ENV/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -59,3 +63,6 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Large data files (Data/ folder already ignored above)
+# Note: .mat files in Data/ are excluded via the Data/ rule

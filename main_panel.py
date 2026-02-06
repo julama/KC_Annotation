@@ -4,9 +4,14 @@ Main entry point for Panel-based EEG K-Complex Annotation Tool.
 
 Usage:
     python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
+    
+For standalone EXE:
+    kc_annotation.exe --mat-file <path_to_file.mat>
+    kc_annotation.exe  # Opens file dialog
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 import pandas as pd
@@ -22,8 +27,36 @@ from src.panel_app.dashboard import create_dashboard
 import config
 
 
+def get_base_path():
+    """Get the base path for the application.
+    
+    Returns the appropriate base path whether running as:
+    - A frozen PyInstaller executable (uses sys._MEIPASS)
+    - A regular Python script (uses script directory)
+    """
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable (PyInstaller)
+        return Path(sys._MEIPASS)
+    else:
+        # Running as a script
+        return Path(__file__).parent
+
+
+def is_frozen():
+    """Check if running as a frozen PyInstaller executable."""
+    return getattr(sys, 'frozen', False)
+
+
 def main():
     """Main function to launch the Panel annotation tool."""
+    # Get base path for resource loading
+    base_path = get_base_path()
+    
+    # Print startup info
+    if is_frozen():
+        print("Running as standalone executable")
+        print(f"Resource path: {base_path}")
+    
     parser = argparse.ArgumentParser(
         description='EEG K-Complex Annotation Tool (Panel/HoloViews)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -32,6 +65,10 @@ Examples:
     python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
     python main_panel.py --mat-file data.mat --channels 34 55 70
     python main_panel.py --mat-file data.mat --port 5007
+    
+    # Standalone EXE:
+    kc_annotation.exe --mat-file <path_to_file.mat>
+    kc_annotation.exe  # Opens file dialog to select .mat file
         """
     )
     parser.add_argument('--mat-file', type=str, help='Path to .mat file')
@@ -59,28 +96,48 @@ Examples:
     args = parser.parse_args()
     
     # Get file paths
+    mat_file = None
     if args.mat_file:
         mat_file = Path(args.mat_file)
     else:
-        # Try to find a default .mat file
-        default_mat = Path("Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat")
-        if default_mat.exists():
-            mat_file = default_mat
-            print(f"Using default .mat file: {mat_file}")
-        else:
-            # Interactive file selection
+        # Try to find a default .mat file (only when not frozen)
+        if not is_frozen():
+            default_mat = Path("Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat")
+            if default_mat.exists():
+                mat_file = default_mat
+                print(f"Using default .mat file: {mat_file}")
+        
+        # If no file found, use file dialog
+        if mat_file is None:
             try:
                 from tkinter import filedialog
                 import tkinter as tk
+                
+                print("Opening file selection dialog...")
                 root = tk.Tk()
                 root.withdraw()
-                mat_file = Path(filedialog.askopenfilename(
-                    title="Select .mat file",
+                # Bring dialog to front
+                root.lift()
+                root.attributes('-topmost', True)
+                
+                selected_file = filedialog.askopenfilename(
+                    title="Select EEG .mat file",
                     filetypes=[("MATLAB files", "*.mat"), ("All files", "*.*")]
-                ))
+                )
                 root.destroy()
+                
+                if selected_file:
+                    mat_file = Path(selected_file)
+                else:
+                    print("No file selected. Exiting.")
+                    sys.exit(0)
+                    
             except ImportError:
                 print("Error: Please provide --mat-file argument or install tkinter")
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error opening file dialog: {e}")
+                print("Please provide --mat-file argument instead.")
                 sys.exit(1)
     
     if not mat_file or not mat_file.exists():
@@ -133,6 +190,10 @@ Examples:
         mat_file.parent.parent / "channels.csv",
         Path("Data/channels.csv"),
     ]
+    # Also check in the bundled resources for frozen apps
+    if is_frozen():
+        possible_channels_files.append(base_path / "Data" / "channels.csv")
+    
     for path in possible_channels_files:
         if path.exists():
             channels_file = str(path)
