@@ -19,6 +19,7 @@ from scipy import signal
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import config
+from src.preprocessing import apply_bandpass_filter
 
 # Suppress HoloViews FutureWarning about pd.unique
 # This is an internal HoloViews issue when processing mixed-type data
@@ -144,6 +145,7 @@ class EEGDashboard(param.Parameterized):
     epoch_index = param.Integer(default=0, bounds=(0, None))
     selected_region_id = param.Integer(default=-1)
     current_label = param.Selector(objects=['KC', 'unannotated'], default='unannotated')
+    show_bandpass_overlay = param.Boolean(default=False)
     update_trigger = param.Integer(default=0)
     focus_plot_trigger = param.Integer(default=0)  # Separate trigger for focus plots (only on epoch/region changes)
     topoplot_popup = param.Parameter(default=None)  # For storing topoplot popup
@@ -188,7 +190,7 @@ class EEGDashboard(param.Parameterized):
         # Topoplot cache: {epoch_index: {region_id: base64_image}}
         self._topoplot_cache = {}
         self._current_epoch_for_cache = -1
-        # Cache for spectral power data (0.5-4 Hz) per epoch
+        # Cache for spectral power data (0.5-2 Hz) per epoch
         # Maps epoch_index -> DataFrame (samples × channels) with power values
         self._spectral_power_cache = {}
         
@@ -215,6 +217,7 @@ class EEGDashboard(param.Parameterized):
         self._cached_focus_plots = {}  # Maps channel_idx -> plot
         self._cached_focus_epoch_index = -1
         self._cached_focus_selected_region = -1
+        self._focus_bandpass_cache = {}
         
         # Click handler debouncing
         self._last_click_time = 0
@@ -310,7 +313,7 @@ class EEGDashboard(param.Parameterized):
             # regions from the previous epoch are invalid and must be refreshed.
             self._cached_regions = None
             
-            # Compute spectral power (0.5-4 Hz) for the entire epoch
+            # Compute spectral power (0.5-2 Hz) for the entire epoch
             self._compute_epoch_spectral_power(epoch_data)
         else:
             # Epoch_data cached, but regions need refresh
@@ -653,10 +656,62 @@ class EEGDashboard(param.Parameterized):
         
         return result
 
+    def _get_selection_info(self, region_id: int) -> Optional[Dict[str, float]]:
+        """Return selection metrics for the currently selected region."""
+        if region_id == -1:
+            return None
+
+        epoch_data, current_regions, _ = self._get_epoch_data()
+        if epoch_data is None or region_id not in current_regions:
+            return None
+
+        region = current_regions[region_id]
+        rel_start = int(region.get('relative_start', 0))
+        rel_stop = int(region.get('relative_stop', 0))
+        if rel_stop <= rel_start:
+            return None
+
+        duration_s = (rel_stop - rel_start) / self.sampling_rate
+        window = epoch_data.iloc[rel_start:rel_stop + 1]
+        if window.empty:
+            return None
+
+        peak_to_peak = (window.max(axis=0) - window.min(axis=0)).max()
+        status = self.annotation_manager.get_annotation_status(region_id)
+        return {
+            'duration_s': float(duration_s),
+            'max_diff_uv': float(peak_to_peak),
+            'status': status,
+        }
+
+    def _selection_info_pane(self, rid: int):
+        """Render selected region information with duration threshold highlighting."""
+        if rid == -1:
+            return pn.pane.HTML(
+                "<div style='font-size:12px; margin:0px;'><b>No Region Selected</b></div>"
+            )
+
+        info = self._get_selection_info(rid)
+        if info is None:
+            return pn.pane.HTML(
+                f"<div style='font-size:12px; margin:0px;'><b>Selected Region:</b> {rid}</div>"
+            )
+
+        duration_color = '#27ae60' if 0.5 <= info['duration_s'] <= 2.0 else '#e74c3c'
+        html = (
+            "<div style='font-size:12px; margin:0px; line-height:1.2;'>"
+            f"<b>Region:</b> {rid} | "
+            f"<b>Status:</b> {info['status']} | "
+            f"<b>Duration:</b> <span style='color:{duration_color};'>{info['duration_s']:.3f}s</span> | "
+            f"<b>Max diff:</b> {info['max_diff_uv']:.1f} uV"
+            "</div>"
+        )
+        return pn.pane.HTML(html)
+
     # --- TOPOPLOT GENERATION ---
     def _compute_epoch_spectral_power(self, epoch_data: pd.DataFrame):
         """
-        Compute spectral power (0.5-4 Hz) for the entire epoch using sliding window approach.
+        Compute spectral power (0.5-2 Hz) for the entire epoch using sliding window approach.
         Stores power values in _spectral_power_cache[epoch_index] as DataFrame (samples × channels).
         """
         if epoch_data is None or len(epoch_data) == 0:
@@ -665,7 +720,7 @@ class EEGDashboard(param.Parameterized):
         try:
             # Parameters for spectral power computation
             low_freq = 0.5  # Hz
-            high_freq = 4.0  # Hz
+            high_freq = 2.0  # Hz (delta band for topoplot pipeline)
             window_length_sec = 2.0  # 2-second windows for power computation
             overlap_sec = 0.5  # 1-second overlap
             
@@ -682,7 +737,7 @@ class EEGDashboard(param.Parameterized):
                 channel_data = epoch_data.iloc[:, ch_idx].values
                 
                 # Use Welch's method with sliding windows
-                # For each window position, compute power in 0.5-4 Hz band
+                # For each window position, compute raw linear power in 0.5-2 Hz band
                 for start_idx in range(0, n_samples - window_length_samples + 1, hop_samples):
                     end_idx = start_idx + window_length_samples
                     window_data = channel_data[start_idx:end_idx]
@@ -695,7 +750,7 @@ class EEGDashboard(param.Parameterized):
                         noverlap=overlap_samples // 2 if overlap_samples > 0 else None
                     )
                     
-                    # Integrate power in 0.5-4 Hz band
+                    # Integrate linear power in 0.5-2 Hz band
                     freq_mask = (freqs >= low_freq) & (freqs <= high_freq)
                     if np.any(freq_mask):
                         band_power = np.trapz(psd[freq_mask], freqs[freq_mask])
@@ -752,8 +807,12 @@ class EEGDashboard(param.Parameterized):
             
             region_power = power_df.iloc[start_idx:stop_idx+1]
             
-            # Average power across time window for each channel
-            mean_power = region_power.mean(axis=0).values
+            # Pipeline:
+            # 1) region_power already contains linear power estimates per sample/channel.
+            # 2) average in linear domain over selected time window.
+            # 3) convert to dB using 10*log10(P_linear) per channel.
+            mean_power_linear = region_power.mean(axis=0).values
+            mean_power_db = 10.0 * np.log10(np.maximum(mean_power_linear, 1e-12))
             
             # Get channel positions
             if not self.chanlocs.empty:
@@ -765,12 +824,12 @@ class EEGDashboard(param.Parameterized):
                     pos = np.array([-self.chanlocs['y'].values, self.chanlocs['x'].values]).T
                 else:
                     # Fallback: create circular layout
-                    n_chans = len(mean_power)
+                    n_chans = len(mean_power_db)
                     angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
                     pos = np.array([np.cos(angles), np.sin(angles)]).T
             else:
                 # Fallback: create circular layout
-                n_chans = len(mean_power)
+                n_chans = len(mean_power_db)
                 angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
                 pos = np.array([np.cos(angles), np.sin(angles)]).T
             
@@ -783,29 +842,44 @@ class EEGDashboard(param.Parameterized):
             
             # Filter out excluded channels from topoplot
             # Track which indices are kept for focus channel marking
-            kept_indices = np.arange(len(mean_power))
+            kept_indices = np.arange(len(mean_power_db))
             if self.exclude_channels:
-                n_chans = len(mean_power)
+                n_chans = len(mean_power_db)
                 # Create mask: True for channels to KEEP
                 mask = np.ones(n_chans, dtype=bool)
                 for idx in self.exclude_channels:
                     if 0 <= idx < n_chans:
                         mask[idx] = False
                 
-                mean_power = mean_power[mask]
+                mean_power_db = mean_power_db[mask]
                 pos = pos[mask]
                 pos_original = pos_original[mask]
                 kept_indices = kept_indices[mask]
+
+            # Robust color limits from current scalp values.
+            # Prefer 5th/95th percentiles; fall back to 2nd/98th if range collapses.
+            finite_vals = mean_power_db[np.isfinite(mean_power_db)]
+            if finite_vals.size >= 2:
+                vmin, vmax = np.percentile(finite_vals, [5, 95])
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
+                    vmin, vmax = np.percentile(finite_vals, [2, 98])
+                if np.isclose(vmin, vmax):
+                    pad = max(1e-3, 0.05 * (abs(vmin) + 1.0))
+                    vmin -= pad
+                    vmax += pad
+                vlim = (float(vmin), float(vmax))
+            else:
+                vlim = (None, None)
             
             # Create topoplot using MNE (showing spectral power)
             fig, ax = plt.subplots(figsize=(3, 3))
             mne.viz.plot_topomap(
-                mean_power,
+                mean_power_db,
                 pos,
                 axes=ax,
                 show=False,
-                cmap='Reds',  # Use Reds colormap for power (all positive values)
-                vlim=(None, None)
+                cmap='Reds',  # dB-scaled power values
+                vlim=vlim
             )
             
             # Mark the 3 focus channels on the topoplot
@@ -1536,7 +1610,7 @@ class EEGDashboard(param.Parameterized):
         
         return combined.opts(plot_opts)
 
-    @param.depends('epoch_index', 'update_trigger')
+    @param.depends('epoch_index', 'update_trigger', 'show_bandpass_overlay')
     def create_focus_channels_plot(self, bounds=None, **kwargs):
         """Create stacked plot with 3 focus channels displayed above each other."""
         import time as time_module
@@ -1568,10 +1642,33 @@ class EEGDashboard(param.Parameterized):
             return hv.Spacer()
         
         t = self._create_time_axis(len(display_df))
+
+        filtered_df = None
+        if self.show_bandpass_overlay:
+            filtered_df = self._focus_bandpass_cache.get(self.epoch_index)
+            if filtered_df is None:
+                try:
+                    filtered_values = apply_bandpass_filter(
+                        display_df,
+                        low_freq=0.5,
+                        high_freq=2.0,
+                        sampling_rate=self.sampling_rate,
+                        order=4,
+                    ).values
+                    filtered_df = pd.DataFrame(
+                        filtered_values,
+                        columns=display_df.columns,
+                        index=display_df.index,
+                    )
+                    self._focus_bandpass_cache[self.epoch_index] = filtered_df
+                except Exception as e:
+                    print(f"[WARNING] Failed to compute 0.5-2 Hz overlay: {e}")
+                    filtered_df = None
         
         # Create curves for each focus channel with vertical offsets
         # Keep raw microvolt values so scale stays consistent across epochs
         curves = []
+        bandpass_curves = []
         first_curve = None
         offset_per_channel = 500  # Vertical spacing between channels
         # === CHANGE Y-AXIS SCALE (3-CHANNEL PLOT) ===
@@ -1608,6 +1705,16 @@ class EEGDashboard(param.Parameterized):
             else:
                 curve = hv.Curve((tt, dd), label=f'Ch {channel_idx}').opts(**curve_opts)
                 curves.append(curve)
+
+            if filtered_df is not None:
+                overlay_vals = filtered_df[col].values + offset
+                tt_filt, dd_filt = downsample_minmax(overlay_vals, t)
+                bandpass_curve = hv.Curve((tt_filt, dd_filt), label=f'Ch {channel_idx} 0.5-2Hz').opts(
+                    color='#2980b9',
+                    line_width=1.0,
+                    alpha=0.6,
+                )
+                bandpass_curves.append(bandpass_curve)
         
         # Calculate y_range to cover all stacked channels
         # Each normalized channel spans roughly -250 to +250, with offsets
@@ -1669,6 +1776,7 @@ class EEGDashboard(param.Parameterized):
         elements = []
         elements.extend(vspans)
         elements.extend(curves)
+        elements.extend(bandpass_curves)
         elements.extend(reference_lines)
         combined = hv.Overlay(elements) * regions_rects
         # Set the range directly on the element to ensure it's preserved
@@ -2043,10 +2151,19 @@ class EEGDashboard(param.Parameterized):
         
         # Removed view mode toggle - only butterfly plot now
 
+        overlay_toggle = pn.widgets.Toggle(
+            name='0.5-2 Hz',
+            value=self.show_bandpass_overlay,
+            button_type='primary',
+            width=90,
+        )
+        self.param.watch(lambda e: setattr(overlay_toggle, 'value', e.new), 'show_bandpass_overlay')
+        overlay_toggle.param.watch(lambda e: setattr(self, 'show_bandpass_overlay', bool(e.new)), 'value')
+
         info = pn.bind(
-            lambda rid: pn.pane.Markdown(f"**Selected Region:** {rid}" if rid != -1 else "**No Region Selected**", 
-                                        styles={'font-size': '12px', 'margin': '0px'}), 
-            rid=self.param.selected_region_id
+            lambda rid, trig: self._selection_info_pane(rid),
+            rid=self.param.selected_region_id,
+            trig=self.param.update_trigger,
         )
         
         # Topoplot is now shown in hover tooltip, no need for fixed display
@@ -2078,6 +2195,8 @@ class EEGDashboard(param.Parameterized):
             info,
             pn.Spacer(width=10),
             radio_group,
+            pn.Spacer(width=10),
+            overlay_toggle,
             pn.Spacer(width=10),
             pn.pane.Markdown("**Keys:** `K`/`C` = KC, `U`/`Y` = unannotated, `D` = delete | **Drag to select** | **Hover for topoplot**",
                            styles={'font-size': '11px', 'margin': '0px'}),

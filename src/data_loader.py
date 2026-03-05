@@ -10,12 +10,13 @@ class EEGData:
     """Container for loaded EEG data and metadata"""
     
     def __init__(self, data: pd.DataFrame, visnum: np.ndarray, srate: float, 
-                 chanlocs: pd.DataFrame, data_id: str):
+                 chanlocs: pd.DataFrame, data_id: str, artndxn: Optional[np.ndarray] = None):
         self.data = data  # samples × channels
         self.visnum = visnum  # sleep stages array
         self.srate = srate  # sampling rate
         self.chanlocs = chanlocs  # channel locations DataFrame
         self.data_id = data_id  # dataset identifier
+        self.artndxn = artndxn  # artifact mask (epochs × channels), 0=bad, 1=good
 
 
 def load_mat_file(filepath: str) -> EEGData:
@@ -75,12 +76,20 @@ def load_mat_file(filepath: str) -> EEGData:
     print(f"  Sampling rate: {srate} Hz")
     print(f"  Number of epochs: {len(visnum)}")
     print(f"  Channels: {len(chanlocs_df) if not chanlocs_df.empty else data_df.shape[1]}")
+
+    artndxn = getattr(eeg_struct, 'artndxn', None)
+    if artndxn is not None:
+        artndxn = np.asarray(artndxn)
+        if artndxn.ndim == 1:
+            artndxn = artndxn.reshape(-1, 1)
+        print(f"  artndxn shape: {artndxn.shape}")
     
     return EEGData(
         data=data_df,
         visnum=visnum,
         srate=srate,
         chanlocs=chanlocs_df,
-        data_id=data_id
+        data_id=data_id,
+        artndxn=artndxn,
     )
 

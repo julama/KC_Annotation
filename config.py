@@ -23,7 +23,7 @@ DEFAULT_SAMPLING_RATE = 125.0  # Hz
 
 # Channels to exclude from analysis (0-based indices)
 # These will be discarded immediately after loading
-EXCLUDE_CHANNELS = None #[42, 47, 48, 55, 62, 67, 72, 80, 87, 93, 98, 106, 112, 118, 119, 124, 125, 126, 127, 128]
+EXCLUDE_CHANNELS = [42, 47, 48, 55, 62, 67, 72, 80, 87, 93, 98, 106, 112, 118, 119, 124, 125, 126, 127, 128]
 
 # Channels to display in the main butterfly plot
 # If None, it will use the automatic subsetting (max 30 channels)

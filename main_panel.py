@@ -19,6 +19,11 @@ import pandas as pd
 import numpy as np
 
 import panel as pn
+try:
+    import mne
+    MNE_AVAILABLE = True
+except ImportError:
+    MNE_AVAILABLE = False
 
 from src.data_loader import load_mat_file
 from src.preprocessing import preprocess_eeg
@@ -26,6 +31,120 @@ from src.epoch_manager import EpochManager
 from src.annotation_manager import AnnotationManager
 from src.panel_app.dashboard import create_dashboard
 import config
+
+def _normalize_artndxn_shape(artndxn: np.ndarray, n_epochs: int, n_channels: int) -> np.ndarray:
+    """Normalize artndxn to shape (epochs, channels) when possible."""
+    if artndxn is None:
+        return None
+
+    arr = np.asarray(artndxn)
+    if arr.ndim != 2:
+        return None
+
+    if arr.shape == (n_epochs, n_channels):
+        return arr
+    if arr.shape == (n_channels, n_epochs):
+        return arr.T
+    if arr.shape[1] == n_channels:
+        return arr
+    if arr.shape[0] == n_channels:
+        return arr.T
+    return None
+
+
+def _make_unique_channel_names(raw_names):
+    """Ensure channel names are unique for MNE."""
+    seen = {}
+    unique = []
+    for idx, name in enumerate(raw_names):
+        base = str(name) if name is not None and str(name) else f"ch_{idx}"
+        count = seen.get(base, 0)
+        if count == 0:
+            unique_name = base
+        else:
+            unique_name = f"{base}_{count}"
+        seen[base] = count + 1
+        unique.append(unique_name)
+    return unique
+
+
+def _interpolate_globally_bad_channels(eeg_data_obj):
+    """
+    Interpolate channels that are marked bad (0) across all epochs in EEG.artndxn.
+    Returns a list of interpolated channel indices.
+    """
+    if not MNE_AVAILABLE:
+        print("Warning: MNE not available; skipping bad-channel interpolation.")
+        return []
+
+    if eeg_data_obj.artndxn is None:
+        return []
+
+    n_channels = eeg_data_obj.data.shape[1]
+    n_epochs = len(eeg_data_obj.visnum)
+    artndxn = _normalize_artndxn_shape(eeg_data_obj.artndxn, n_epochs=n_epochs, n_channels=n_channels)
+    if artndxn is None:
+        print("Warning: Could not align EEG.artndxn to (epochs, channels). Skipping interpolation.")
+        return []
+
+    globally_bad_mask = np.all(artndxn == 0, axis=0)
+    bad_indices = np.where(globally_bad_mask)[0].tolist()
+    if not bad_indices:
+        print("No globally bad channels detected in EEG.artndxn.")
+        return []
+
+    print(f"Globally bad channels detected (to interpolate): {bad_indices}")
+
+    try:
+        chanlocs = eeg_data_obj.chanlocs
+        if chanlocs.empty:
+            print("Warning: No channel locations available; skipping interpolation.")
+            return []
+
+        if 'labels' in chanlocs.columns and len(chanlocs['labels']) >= n_channels:
+            channel_names = _make_unique_channel_names(chanlocs['labels'].tolist()[:n_channels])
+        else:
+            channel_names = [f"ch_{i}" for i in range(n_channels)]
+
+        if all(col in chanlocs.columns for col in ['X', 'Y', 'Z']):
+            x_vals = chanlocs['X'].values
+            y_vals = chanlocs['Y'].values
+            z_vals = chanlocs['Z'].values
+        elif all(col in chanlocs.columns for col in ['x', 'y', 'z']):
+            x_vals = chanlocs['x'].values
+            y_vals = chanlocs['y'].values
+            z_vals = chanlocs['z'].values
+        else:
+            print("Warning: No XYZ channel coordinates found; skipping interpolation.")
+            return []
+
+        ch_pos = {}
+        for idx in range(min(n_channels, len(x_vals), len(y_vals), len(z_vals))):
+            xyz = np.array([x_vals[idx], y_vals[idx], z_vals[idx]], dtype=float)
+            if np.all(np.isfinite(xyz)):
+                ch_pos[channel_names[idx]] = xyz
+
+        if len(ch_pos) < 4:
+            print("Warning: Not enough valid channel positions for interpolation.")
+            return []
+
+        info = mne.create_info(ch_names=channel_names, sfreq=eeg_data_obj.srate, ch_types=['eeg'] * n_channels)
+        raw = mne.io.RawArray(eeg_data_obj.data.values.T, info, verbose='ERROR')
+        montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+        raw.set_montage(montage, on_missing='ignore')
+        raw.info['bads'] = [channel_names[idx] for idx in bad_indices if idx < len(channel_names)]
+
+        raw.interpolate_bads(reset_bads=False, verbose='ERROR')
+        eeg_data_obj.data = pd.DataFrame(
+            raw.get_data().T,
+            columns=eeg_data_obj.data.columns,
+            index=eeg_data_obj.data.index,
+        )
+        print(f"Interpolated {len(raw.info['bads'])} globally bad channels using MNE.")
+        return bad_indices
+    except Exception as exc:
+        print(f"Warning: MNE interpolation failed: {exc}")
+        return []
 
 
 def get_base_path():
@@ -150,6 +269,9 @@ Examples:
     print(f"Loading .mat file: {mat_file}")
     print(f"{'='*60}")
     eeg_data_obj = load_mat_file(str(mat_file))
+
+    # Interpolate globally bad channels from EEG.artndxn (0=bad, 1=good)
+    interpolated_bad_channels = _interpolate_globally_bad_channels(eeg_data_obj)
     
     # Apply preprocessing
     print("\nApplying preprocessing...")
@@ -210,7 +332,7 @@ Examples:
         main_plot_channels=config.MAIN_PLOT_CHANNELS,
         chanlocs=eeg_data_obj.chanlocs,  # Pass channel locations for topoplots
         channels_file=channels_file,
-        exclude_channels=config.EXCLUDE_CHANNELS,
+        exclude_channels=sorted(set((config.EXCLUDE_CHANNELS or []) + interpolated_bad_channels)),
     )
     
     # Wrap in a servable template
