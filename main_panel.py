@@ -4,6 +4,7 @@ Main entry point for Panel-based EEG K-Complex Annotation Tool.
 
 Usage:
     python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_01_W1/EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
+    python main_panel.py --mat-file Data/EPISL_01_W1/EPISL_02_W1/EPISL_02_W1_EEG_FiltDwn_05to30Hz.mat
     
 For standalone EXE:
     kc_annotation.exe --mat-file <path_to_file.mat>

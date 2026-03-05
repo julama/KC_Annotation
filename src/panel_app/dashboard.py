@@ -1570,24 +1570,24 @@ class EEGDashboard(param.Parameterized):
         t = self._create_time_axis(len(display_df))
         
         # Create curves for each focus channel with vertical offsets
-        # Normalize each channel similar to butterfly plot, then apply offsets
+        # Keep raw microvolt values so scale stays consistent across epochs
         curves = []
         first_curve = None
         offset_per_channel = 500  # Vertical spacing between channels
         # === CHANGE Y-AXIS SCALE (3-CHANNEL PLOT) ===
-        channel_range = 200  # Y-axis range per channel: -200..200
+        channel_range = 200  # Y-axis range per channel: -200..200 uV
         
         for i_idx, channel_idx in enumerate(valid_channels):
             col = display_df.columns[channel_idx]
             d = display_df[col].values
             
-            # Normalize channel similar to butterfly plot (scale to ~30 units)
-            d_normalized = (d - np.mean(d)) / (np.std(d) or 1) * 30
+            # Use raw signal in microvolts; avoid per-epoch rescaling.
+            d_uv = d
             
             # Apply vertical offset: first channel (i_idx=0) at TOP, last channel at BOTTOM
             # This ensures config order [Fz, 6, Pz] displays as Fz on top, Pz at bottom
             offset = (len(valid_channels) - 1 - i_idx) * offset_per_channel
-            d_offset = d_normalized + offset
+            d_offset = d_uv + offset
             
             tt, dd = downsample_minmax(d_offset, t)
             color = self._get_channel_color(channel_idx)
@@ -1716,7 +1716,7 @@ class EEGDashboard(param.Parameterized):
                     }}
                     return v.toFixed(0);
                 """)
-                plot.state.yaxis[0].axis_label = "Amplitude (normalized)"
+                plot.state.yaxis[0].axis_label = "Amplitude (uV)"
         
         def set_y_range(plot, element):
             """Hook to set y-axis range dynamically and lock it - 3-CHANNEL PLOT ONLY"""
