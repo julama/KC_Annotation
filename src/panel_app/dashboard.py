@@ -409,6 +409,13 @@ class EEGDashboard(param.Parameterized):
         # Prevent processing if bounds haven't actually changed (stale callback)
         if hasattr(self, '_last_bounds') and self._last_bounds == bounds:
             return
+
+        # Time-guard: reject rapid-fire events from multiple on_change callbacks
+        import time as _t
+        now = _t.time()
+        if hasattr(self, '_last_box_select_time') and (now - self._last_box_select_time) < 0.25:
+            return
+        self._last_box_select_time = now
         
         self._processing_box_select = True
         
@@ -997,6 +1004,8 @@ class EEGDashboard(param.Parameterized):
                 <strong>Region @region_id</strong><br>
                 Status: @status<br>
                 Time: @x0{0.00}s - @x1{0.00}s<br>
+                Duration: @duration_html{safe}<br>
+                Max diff: @max_diff_text<br>
                 @topo_html{safe}
             </div>
             """,
@@ -1078,6 +1087,17 @@ class EEGDashboard(param.Parameterized):
                     region_id in self._topoplot_cache[self.epoch_index]):
                     topo_img = self._topoplot_cache[self.epoch_index][region_id]
                     topo_html = f'<img src="{topo_img}" style="width: 200px; height: 200px; margin-top: 5px; display: block;">'
+
+            duration_s = (rel_stop - rel_start) / self.sampling_rate
+            duration_color = '#27ae60' if 0.5 <= duration_s <= 2.0 else '#e74c3c'
+            duration_html = f"<span style='color:{duration_color};'>{duration_s:.3f}s</span>"
+
+            max_diff_text = "n/a"
+            if epoch_data is not None and rel_stop > rel_start:
+                region_window = epoch_data.iloc[rel_start:rel_stop + 1]
+                if not region_window.empty:
+                    max_diff_uv = (region_window.max(axis=0) - region_window.min(axis=0)).max()
+                    max_diff_text = f"{float(max_diff_uv):.1f} uV"
             
             # Store region metadata for lazy topoplot generation
             rect_data.append({
@@ -1085,6 +1105,8 @@ class EEGDashboard(param.Parameterized):
                 'x1': stop_time, 'y1': y_max,
                 'region_id': region_id, 'status': status, 'fill_color': fill, 
                 'line_color': lc, 'line_width': lw, 'alpha': alpha,
+                'duration_html': duration_html,
+                'max_diff_text': max_diff_text,
                 'topo_html': topo_html,  # Show if cached, empty otherwise
                 'rel_start': rel_start,  # Store for lazy generation
                 'rel_stop': rel_stop  # Store for lazy generation
@@ -1092,7 +1114,8 @@ class EEGDashboard(param.Parameterized):
         
         df_rects = pd.DataFrame(rect_data)
         rects = hv.Rectangles(df_rects, kdims=['x0','y0','x1','y1'], 
-                             vdims=['region_id','status','fill_color','line_color','line_width','alpha','topo_html','rel_start','rel_stop'])
+                             vdims=['region_id','status','fill_color','line_color','line_width','alpha',
+                                    'duration_html','max_diff_text','topo_html','rel_start','rel_stop'])
         
         # Store epoch_data for hover tool callback
         if epoch_data is not None:
@@ -1526,6 +1549,10 @@ class EEGDashboard(param.Parameterized):
             if not hasattr(self, '_bounds_stream') or self._bounds_stream is None:
                 return
 
+            # Prevent re-attaching on every redraw
+            if getattr(plot, '_box_stream_attached', False):
+                return
+
             def attach():
                 box_select = None
                 if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
@@ -1536,6 +1563,7 @@ class EEGDashboard(param.Parameterized):
                 if not box_select or not hasattr(box_select, 'overlay') or box_select.overlay is None:
                     return
                 stream_ref = self._bounds_stream
+                debounce_state = {'timer': None}
 
                 def push_bounds_to_stream():
                     o = box_select.overlay
@@ -1546,16 +1574,24 @@ class EEGDashboard(param.Parameterized):
                     if left is not None and right is not None and top is not None and bottom is not None:
                         x0, x1 = min(left, right), max(left, right)
                         y0, y1 = min(top, bottom), max(top, bottom)
-                        try:
-                            stream_ref.event(bounds=(x0, y0, x1, y1))
-                        except Exception:
-                            pass
+                        bounds = (x0, y0, x1, y1)
+                        if debounce_state['timer'] is not None:
+                            debounce_state['timer'].cancel()
+                        def fire():
+                            try:
+                                stream_ref.event(bounds=bounds)
+                            except Exception:
+                                pass
+                        debounce_state['timer'] = threading.Timer(0.15, fire)
+                        debounce_state['timer'].daemon = True
+                        debounce_state['timer'].start()
 
                 for prop in ('left', 'right', 'top', 'bottom'):
                     try:
                         box_select.overlay.on_change(prop, lambda a, o, n: push_bounds_to_stream())
                     except Exception:
                         pass
+                plot._box_stream_attached = True
 
             attach()
             if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
@@ -1953,6 +1989,10 @@ class EEGDashboard(param.Parameterized):
             if not hasattr(self, '_bounds_stream_focus') or self._bounds_stream_focus is None:
                 return
 
+            # Prevent re-attaching on every redraw
+            if getattr(plot, '_box_stream_focus_attached', False):
+                return
+
             def attach():
                 box_select = None
                 if hasattr(plot, 'state') and hasattr(plot.state, 'tools'):
@@ -1963,6 +2003,7 @@ class EEGDashboard(param.Parameterized):
                 if not box_select or not hasattr(box_select, 'overlay') or box_select.overlay is None:
                     return
                 stream_ref = self._bounds_stream_focus
+                debounce_state = {'timer': None}
 
                 def push_bounds_to_stream():
                     o = box_select.overlay
@@ -1973,16 +2014,24 @@ class EEGDashboard(param.Parameterized):
                     if left is not None and right is not None and top is not None and bottom is not None:
                         x0, x1 = min(left, right), max(left, right)
                         y0, y1 = min(top, bottom), max(top, bottom)
-                        try:
-                            stream_ref.event(bounds=(x0, y0, x1, y1))
-                        except Exception:
-                            pass
+                        bounds = (x0, y0, x1, y1)
+                        if debounce_state['timer'] is not None:
+                            debounce_state['timer'].cancel()
+                        def fire():
+                            try:
+                                stream_ref.event(bounds=bounds)
+                            except Exception:
+                                pass
+                        debounce_state['timer'] = threading.Timer(0.15, fire)
+                        debounce_state['timer'].daemon = True
+                        debounce_state['timer'].start()
 
                 for prop in ('left', 'right', 'top', 'bottom'):
                     try:
                         box_select.overlay.on_change(prop, lambda a, o, n: push_bounds_to_stream())
                     except Exception:
                         pass
+                plot._box_stream_focus_attached = True
 
             attach()
             if hasattr(plot, 'state') and hasattr(plot.state, 'document') and plot.state.document:
