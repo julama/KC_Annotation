@@ -1019,8 +1019,39 @@ class EEGDashboard(param.Parameterized):
                                 epoch_data: Optional[pd.DataFrame] = None,
                                 time_offset_seconds: float = 0.0):
         """Create rectangles for selected regions."""
+        # Define vdims consistently - MUST match columns in rect_data below
+        vdims = ['region_id', 'status', 'fill_color', 'line_color', 'line_width', 
+                 'alpha', 'topo_html', 'rel_start', 'rel_stop']
+        
         if not regions:
-            return hv.Rectangles([], kdims=['x0', 'y0', 'x1', 'y1'])
+            # Create a dummy invisible rectangle with all required columns
+            # This ensures Bokeh ColumnDataSource is properly initialized with all columns
+            # Using alpha=0 makes it invisible but the columns will exist
+            y_min, y_max = y_range
+            dummy_df = pd.DataFrame({
+                'x0': [0.0],
+                'y0': [y_min],
+                'x1': [0.001],  # Very tiny
+                'y1': [y_max],
+                'region_id': ['_dummy_'],
+                'status': ['none'],
+                'fill_color': ['#000000'],
+                'line_color': ['#000000'],
+                'line_width': [0.0],
+                'alpha': [0.0],  # Invisible
+                'topo_html': [''],
+                'rel_start': [0],
+                'rel_stop': [0],
+            })
+            rects = hv.Rectangles(dummy_df, kdims=['x0', 'y0', 'x1', 'y1'], vdims=vdims)
+            return rects.opts(
+                color='fill_color',
+                line_color='line_color', 
+                line_width='line_width',
+                alpha='alpha',
+                tools=['hover', 'tap'],
+                clone=False
+            )
         
         y_min, y_max = y_range
         rect_data = []
@@ -1176,6 +1207,17 @@ class EEGDashboard(param.Parameterized):
             if not rect_renderers:
                 # print(f"[HOVER DEBUG] Hook: No Quad renderers yet. Found: {renderer_types}")
                 return False
+            
+            # Debug: Check what columns exist in the data source
+            for rr in rect_renderers:
+                if hasattr(rr, 'data_source') and hasattr(rr.data_source, 'column_names'):
+                    cols = rr.data_source.column_names
+                    print(f"[HOVER DEBUG] Quad renderer columns: {cols}")
+                    # Check if required columns exist
+                    required = ['region_id', 'status', 'topo_html']
+                    missing = [c for c in required if c not in cols]
+                    if missing:
+                        print(f"[HOVER DEBUG] WARNING: Missing columns: {missing}")
             
             # Find existing HoverTool for rectangles or create a new one
             hover_tool = None
