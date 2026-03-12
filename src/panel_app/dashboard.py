@@ -159,6 +159,7 @@ class EEGDashboard(param.Parameterized):
     focus_plot_trigger = param.Integer(default=0)  # Separate trigger for focus plots (only on epoch/region changes)
     topoplot_popup = param.Parameter(default=None)  # For storing topoplot popup
     topoplot_trigger = param.Integer(default=0) # Trigger for delayed topoplot generation
+    status_trigger = param.Integer(default=0)  # Lightweight trigger for status bar only (no plot redraws)
     
     def __init__(self, epoch_manager, annotation_manager, 
                  focus_channels: List[int] = None,
@@ -235,7 +236,12 @@ class EEGDashboard(param.Parameterized):
         self._last_click_region = None
         self._click_debounce_time = 0.3  # 300ms debounce for clicks
         self._processing_click = False
-        
+
+        # Bokeh ColumnDataSource references for fast annotation color updates
+        # (avoids full HoloViews->Bokeh redraw when only rectangle colors change)
+        self._bokeh_rect_sources = []
+        self._skip_label_change_handler = False
+
         # Track when epoch actually changes (for box selection clearing)
         self._previous_epoch_index = -1
         self._should_clear_box_selection = False
@@ -581,29 +587,33 @@ class EEGDashboard(param.Parameterized):
                         return
                     
                     debug_print(f"🎯 Clicked region: {region_id} (get_epoch_data: {(t1-t0)*1000:.1f}ms, find_region: {(t2-t1)*1000:.1f}ms)")
-                    
+
                     t3 = time_module.time()
                     self.selected_region_id = region_id
-                    
-                    # REMOVED: Synchronous topoplot generation to improve responsiveness
-                    # The topoplot will be generated asynchronously via _schedule_topoplot_update
-                    
-                    # Sync label
+
+                    # Sync label (suppress _on_label_change — we handle the update here)
                     status = self.annotation_manager.get_annotation_status(region_id)
+                    self._skip_label_change_handler = True
                     self.current_label = status
+                    self._skip_label_change_handler = False
                     t6 = time_module.time()
-                    
+
                     # Store click info for debouncing
                     self._last_click_time = click_time
                     self._last_click_region = region_id
                     self._last_click_sample = click_sample
-                    
+
                     debug_print(f"   Timing: set_selected={((t3-t2)*1000):.1f}ms, label={((t6-t3)*1000):.1f}ms")
-                    
+
+                    # Try fast path (only selection highlight changes, no annotation change)
+                    self._cached_regions = None
                     click_complete_time = time_module.time()
-                    self._debounced_update()
+                    if not self._fast_update_rect_colors():
+                        self._debounced_update()
+                    else:
+                        self.status_trigger += 1
                     t7 = time_module.time()
-                    debug_print(f"   Total click handler: {((t7-t0)*1000):.1f}ms (debounce scheduled at {((t7-click_complete_time)*1000):.1f}ms)")
+                    debug_print(f"   Total click handler: {((t7-t0)*1000):.1f}ms (update at {((t7-click_complete_time)*1000):.1f}ms)")
                     
                     # Store click time to compare with plot creation
                     if not hasattr(self, '_click_times'):
@@ -621,54 +631,149 @@ class EEGDashboard(param.Parameterized):
         key = event.new
         if not key or self.selected_region_id == -1:
             return
-        
+
         print(f"⌨️ Key Press: {key}")
-        
+
         # Map keys to actions
         if key in ['k', 'c']:
             # Mark as KC
             self.annotation_manager.set_annotation(self.selected_region_id, True)
+            self._cached_regions = None
+            self._cached_focus_plots = {}
+            # Suppress _on_label_change (we handle everything here)
+            self._skip_label_change_handler = True
             self.current_label = 'KC'
+            self._skip_label_change_handler = False
+            # Try fast Bokeh-level update; fall back to full redraw
+            if not self._fast_update_rect_colors():
+                self.focus_plot_trigger += 1
+                self._debounced_update()
+            else:
+                self.status_trigger += 1
         elif key in ['u', 'y']:
             # Mark as unannotated
             self.annotation_manager.set_annotation(self.selected_region_id, False)
+            self._cached_regions = None
+            self._cached_focus_plots = {}
+            self._skip_label_change_handler = True
             self.current_label = 'unannotated'
+            self._skip_label_change_handler = False
+            if not self._fast_update_rect_colors():
+                self.focus_plot_trigger += 1
+                self._debounced_update()
+            else:
+                self.status_trigger += 1
         elif key in ['d', 'delete']:
-                # Delete region
+                # Delete region — always full redraw (rectangle count changes)
                 if self.annotation_manager.delete_region(self.selected_region_id):
                     print(f"🗑️ Deleted region {self.selected_region_id}")
                     self.selected_region_id = -1
+                    self._skip_label_change_handler = True
                     self.current_label = 'unannotated'
-                    # Invalidate regions cache
+                    self._skip_label_change_handler = False
                     self._cached_regions = None
-                    # Invalidate focus plot cache (regions changed)
                     self._cached_focus_plots = {}
-                    self.focus_plot_trigger += 1  # Update focus plots
+                    self._bokeh_rect_sources = []  # Structure changed, clear stale refs
+                    self.focus_plot_trigger += 1
                     self._debounced_update()
-        
+
         # Reset listener so repeated keys work
         self.kb_listener.key = ""
 
     @param.depends('current_label', watch=True)
     def _on_label_change(self):
-        """Update annotation when label changes (via Key or UI)."""
+        """Update annotation when label changes (via radio button UI).
+
+        Keyboard and click handlers set _skip_label_change_handler=True
+        to prevent duplicate work when they already handle the update.
+        """
+        if self._skip_label_change_handler:
+            return
         if self.selected_region_id == -1:
             return
-        
+
         if self.current_label == 'KC':
             self.annotation_manager.set_annotation(self.selected_region_id, True)
         else:
             self.annotation_manager.set_annotation(self.selected_region_id, False)
-        
+
         # Invalidate regions cache (annotation status changed)
         self._cached_regions = None
-        # Invalidate focus plot cache (regions changed)
         self._cached_focus_plots = {}
-        self.focus_plot_trigger += 1  # Update focus plots
-        self._debounced_update()
+        # Try fast path (for radio button clicks)
+        if not self._fast_update_rect_colors():
+            self.focus_plot_trigger += 1
+            self._debounced_update()
+        else:
+            self.status_trigger += 1
+
+    def _fast_update_rect_colors(self):
+        """
+        Fast path: directly patch Bokeh ColumnDataSources for rectangle renderers.
+        Uses source.patch() which sends a ColumnsPatchedEvent — always flushed
+        to the browser, unlike source.data replacement which can be silently held.
+        Returns True if successful, False to fall back to full redraw.
+        """
+        if not self._bokeh_rect_sources:
+            return False
+
+        patched_any = False
+        try:
+            for source in self._bokeh_rect_sources:
+                data = source.data
+                if 'region_id' not in data or len(data['region_id']) == 0:
+                    continue
+
+                n = len(data['region_id'])
+                fill_patches = []
+                lc_patches = []
+                lw_patches = []
+                alpha_patches = []
+                status_patches = []
+
+                for i in range(n):
+                    rid = int(data['region_id'][i])
+                    status = self.annotation_manager.get_annotation_status(rid)
+                    is_sel = (rid == self.selected_region_id)
+
+                    if status == 'KC':
+                        fill = ANNOTATION_COLORS['KC']
+                        base_lc = ANNOTATION_COLORS['KC']
+                    else:
+                        fill = ANNOTATION_COLORS['unannotated']
+                        base_lc = ANNOTATION_COLORS['unannotated']
+
+                    if is_sel:
+                        lc = '#FFD700'
+                        lw = 4
+                        alpha = 0.25
+                    else:
+                        lc = base_lc
+                        lw = 2
+                        alpha = 0.15
+
+                    fill_patches.append((i, fill))
+                    lc_patches.append((i, lc))
+                    lw_patches.append((i, lw))
+                    alpha_patches.append((i, alpha))
+                    status_patches.append((i, status))
+
+                source.patch({
+                    'fill_color': fill_patches,
+                    'line_color': lc_patches,
+                    'line_width': lw_patches,
+                    'alpha': alpha_patches,
+                    'status': status_patches,
+                })
+                patched_any = True
+
+            return patched_any
+        except Exception as e:
+            debug_print(f"Fast annotation update failed: {e}")
+            return False
 
     # --- STATUS BAR ---
-    @param.depends('epoch_index', 'update_trigger')
+    @param.depends('epoch_index', 'update_trigger', 'status_trigger')
     def status_bar(self):
         """Create reactive status bar with epoch info and annotation counts."""
         import time as time_module
@@ -1219,7 +1324,12 @@ class EEGDashboard(param.Parameterized):
             if not rect_renderers:
                 # print(f"[HOVER DEBUG] Hook: No Quad renderers yet. Found: {renderer_types}")
                 return False
-            
+
+            # Capture data sources for fast annotation color updates
+            for rr in rect_renderers:
+                if rr.data_source not in self._bokeh_rect_sources:
+                    self._bokeh_rect_sources.append(rr.data_source)
+
             # Find existing HoverTool for rectangles or create a new one
             hover_tool = None
             if hasattr(plot.state, 'tools'):
@@ -1288,6 +1398,8 @@ class EEGDashboard(param.Parameterized):
             # Also clear focus plot cache
             self._cached_focus_plots = {}
             self._cached_focus_epoch_index = -1
+            # Clear stale Bokeh data source references (new render will recapture)
+            self._bokeh_rect_sources = []
             # Trigger focus plot update
             self.focus_plot_trigger += 1
         
@@ -2250,9 +2362,10 @@ class EEGDashboard(param.Parameterized):
         overlay_toggle.param.watch(lambda e: setattr(self, 'show_bandpass_overlay', bool(e.new)), 'value')
 
         info = pn.bind(
-            lambda rid, trig: self._selection_info_pane(rid),
+            lambda rid, trig, strig: self._selection_info_pane(rid),
             rid=self.param.selected_region_id,
             trig=self.param.update_trigger,
+            strig=self.param.status_trigger,
         )
         
         # Topoplot is now shown in hover tooltip, no need for fixed display
