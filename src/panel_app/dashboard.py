@@ -459,6 +459,12 @@ class EEGDashboard(param.Parameterized):
             
             # Store last bounds to prevent duplicate processing
             self._last_bounds = bounds
+
+            # Sample-index dedup: never create two regions with the same range in the same epoch
+            region_key = (epoch_start_idx, start_idx, stop_idx)
+            if hasattr(self, '_last_created_region_key') and self._last_created_region_key == region_key:
+                return
+            self._last_created_region_key = region_key
             
             # Add new region
             region_id = self.annotation_manager.add_region(start_idx, stop_idx, epoch_start_idx)
@@ -1233,10 +1239,6 @@ class EEGDashboard(param.Parameterized):
         t0 = time_module.time()
         plot_start_time = t0
         
-        # Clear last bounds when epoch changes to allow new selections
-        if hasattr(self, '_last_bounds'):
-            delattr(self, '_last_bounds')
-        
         # Clear epoch_data cache if epoch changed
         epoch_changed_for_cache = (self._cached_epoch_data_index != self.epoch_index)
         # Check if epoch_index param actually changed (not just update_trigger)
@@ -1257,6 +1259,11 @@ class EEGDashboard(param.Parameterized):
             self._should_clear_box_selection = True
             self._should_clear_box_selection_focus = True
             self._previous_epoch_index = self.epoch_index
+            # Clear dedup state so new selections work on the new epoch
+            if hasattr(self, '_last_bounds'):
+                delattr(self, '_last_bounds')
+            if hasattr(self, '_last_created_region_key'):
+                delattr(self, '_last_created_region_key')
             # Clear box selection bounds when epoch changes
             if hasattr(self, '_bounds_stream') and self._bounds_stream is not None:
                 try:
@@ -1651,10 +1658,6 @@ class EEGDashboard(param.Parameterized):
         """Create stacked plot with 3 focus channels displayed above each other."""
         import time as time_module
         t0 = time_module.time()
-        
-        # Clear last bounds when epoch changes to allow new selections
-        if hasattr(self, '_last_bounds'):
-            delattr(self, '_last_bounds')
         
         # Check if epoch_index actually changed (not just update_trigger)
         # The flag is set in create_main_plot, so we just check it here
