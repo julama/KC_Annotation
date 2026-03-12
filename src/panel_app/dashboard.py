@@ -37,6 +37,15 @@ pn.extension('tabulator', sizing_mode='stretch_width')
 hv.extension('bokeh')
 
 # --- CONFIGURATION ---
+DEBUG = False
+
+
+def debug_print(*args, **kwargs):
+    """Debug logger for hot-path instrumentation."""
+    if DEBUG:
+        print(*args, **kwargs)
+
+
 # === CHANGE ANNOTATION COLORS ===
 # Modify these to change the color of annotated regions
 ANNOTATION_COLORS = {
@@ -193,6 +202,8 @@ class EEGDashboard(param.Parameterized):
         # Cache for spectral power data (0.5-2 Hz) per epoch
         # Maps epoch_index -> DataFrame (samples × channels) with power values
         self._spectral_power_cache = {}
+        self._spectral_power_in_progress = set()
+        self._spectral_power_lock = threading.Lock()
         
         # Debounce mechanism for update_trigger
         self._update_timer = None
@@ -268,7 +279,7 @@ class EEGDashboard(param.Parameterized):
                 t_before = time_module.time()
                 self.update_trigger += 1
                 t_after = time_module.time()
-                print(f"⏱️ update_trigger incremented: delay={((t_before-update_request_time)*1000):.1f}ms, increment_time={((t_after-t_before)*1000):.1f}ms")
+                debug_print(f"⏱️ update_trigger incremented: delay={((t_before-update_request_time)*1000):.1f}ms, increment_time={((t_after-t_before)*1000):.1f}ms")
                 self._pending_update = False
             self._update_timer = None
         
@@ -313,8 +324,8 @@ class EEGDashboard(param.Parameterized):
             # regions from the previous epoch are invalid and must be refreshed.
             self._cached_regions = None
             
-            # Compute spectral power (0.5-2 Hz) for the entire epoch
-            self._compute_epoch_spectral_power(epoch_data)
+            # Schedule spectral power computation in background (do not block UI redraw).
+            self._schedule_spectral_power_compute(self.epoch_index, epoch_data)
         else:
             # Epoch_data cached, but regions need refresh
             epoch_info = self.epoch_manager.get_current_epoch_info()
@@ -330,6 +341,35 @@ class EEGDashboard(param.Parameterized):
             current_regions = self._cached_regions
         
         return epoch_data, current_regions, self._cached_epoch_start
+
+    def _schedule_spectral_power_compute(self, epoch_index: int, epoch_data: pd.DataFrame):
+        """Schedule per-epoch spectral power computation in the background."""
+        if epoch_data is None or len(epoch_data) == 0:
+            return
+
+        with self._spectral_power_lock:
+            if epoch_index in self._spectral_power_cache:
+                return
+            if epoch_index in self._spectral_power_in_progress:
+                return
+            self._spectral_power_in_progress.add(epoch_index)
+
+        # Copy to avoid any accidental mutation/race on shared objects.
+        epoch_data_copy = epoch_data.copy()
+
+        def worker():
+            try:
+                self._compute_epoch_spectral_power(epoch_data_copy, epoch_index=epoch_index)
+            finally:
+                with self._spectral_power_lock:
+                    self._spectral_power_in_progress.discard(epoch_index)
+                # Refresh panels that depend on topoplot availability.
+                if self.epoch_index == epoch_index:
+                    self.topoplot_trigger += 1
+                    self._debounced_update(delay=0.05)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
 
     def _get_display_window_data(self) -> Tuple[pd.DataFrame, int, int, float, float]:
         """
@@ -449,10 +489,10 @@ class EEGDashboard(param.Parameterized):
             stop_idx = max(0, min(stop_idx, len(epoch_data) - 1))
             
             if start_idx >= stop_idx:
-                print("⚠️ Invalid selection: start >= stop")
+                debug_print("⚠️ Invalid selection: start >= stop")
                 return
             
-            print(
+            debug_print(
                 f"📦 Box selected (display): {start_time:.3f}s - {end_time:.3f}s | "
                 f"(epoch-relative samples {start_idx}-{stop_idx}, epoch window {center_start_time_s:.1f}s-{center_end_time_s:.1f}s)"
             )
@@ -540,7 +580,7 @@ class EEGDashboard(param.Parameterized):
                     if self.selected_region_id == region_id:
                         return
                     
-                    print(f"🎯 Clicked region: {region_id} (get_epoch_data: {(t1-t0)*1000:.1f}ms, find_region: {(t2-t1)*1000:.1f}ms)")
+                    debug_print(f"🎯 Clicked region: {region_id} (get_epoch_data: {(t1-t0)*1000:.1f}ms, find_region: {(t2-t1)*1000:.1f}ms)")
                     
                     t3 = time_module.time()
                     self.selected_region_id = region_id
@@ -558,12 +598,12 @@ class EEGDashboard(param.Parameterized):
                     self._last_click_region = region_id
                     self._last_click_sample = click_sample
                     
-                    print(f"   Timing: set_selected={((t3-t2)*1000):.1f}ms, label={((t6-t3)*1000):.1f}ms")
+                    debug_print(f"   Timing: set_selected={((t3-t2)*1000):.1f}ms, label={((t6-t3)*1000):.1f}ms")
                     
                     click_complete_time = time_module.time()
                     self._debounced_update()
                     t7 = time_module.time()
-                    print(f"   Total click handler: {((t7-t0)*1000):.1f}ms (debounce scheduled at {((t7-click_complete_time)*1000):.1f}ms)")
+                    debug_print(f"   Total click handler: {((t7-t0)*1000):.1f}ms (debounce scheduled at {((t7-click_complete_time)*1000):.1f}ms)")
                     
                     # Store click time to compare with plot creation
                     if not hasattr(self, '_click_times'):
@@ -665,7 +705,7 @@ class EEGDashboard(param.Parameterized):
         
         total_time = (t3 - t0) * 1000
         if total_time > 50:  # Log if > 50ms
-            print(f"⏱️ status_bar: get_epoch_data={((t1-t0)*1000):.1f}ms, create_markdown={((t2-t1)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
+            debug_print(f"⏱️ status_bar: get_epoch_data={((t1-t0)*1000):.1f}ms, create_markdown={((t2-t1)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
         
         return result
 
@@ -722,13 +762,15 @@ class EEGDashboard(param.Parameterized):
         return pn.pane.HTML(html)
 
     # --- TOPOPLOT GENERATION ---
-    def _compute_epoch_spectral_power(self, epoch_data: pd.DataFrame):
+    def _compute_epoch_spectral_power(self, epoch_data: pd.DataFrame, epoch_index: Optional[int] = None):
         """
         Compute spectral power (0.5-2 Hz) for the entire epoch using sliding window approach.
         Stores power values in _spectral_power_cache[epoch_index] as DataFrame (samples × channels).
         """
         if epoch_data is None or len(epoch_data) == 0:
             return
+        if epoch_index is None:
+            epoch_index = self.epoch_index
         
         try:
             # Parameters for spectral power computation
@@ -766,7 +808,11 @@ class EEGDashboard(param.Parameterized):
                     # Integrate linear power in 0.5-2 Hz band
                     freq_mask = (freqs >= low_freq) & (freqs <= high_freq)
                     if np.any(freq_mask):
-                        band_power = np.trapz(psd[freq_mask], freqs[freq_mask])
+                        # NumPy 2.x prefers trapezoid; keep fallback for older versions.
+                        if hasattr(np, 'trapezoid'):
+                            band_power = np.trapezoid(psd[freq_mask], freqs[freq_mask])
+                        else:
+                            band_power = np.trapz(psd[freq_mask], freqs[freq_mask])
                     else:
                         band_power = 0.0
                     
@@ -790,10 +836,11 @@ class EEGDashboard(param.Parameterized):
             
             # Store as DataFrame
             power_df = pd.DataFrame(power_data, columns=epoch_data.columns, index=epoch_data.index)
-            self._spectral_power_cache[self.epoch_index] = power_df
+            with self._spectral_power_lock:
+                self._spectral_power_cache[epoch_index] = power_df
             
         except Exception as e:
-            print(f"[ERROR SPECTRAL] Error computing spectral power for epoch {self.epoch_index}: {e}")
+            print(f"[ERROR SPECTRAL] Error computing spectral power for epoch {epoch_index}: {e}")
             import traceback
             traceback.print_exc()
     
@@ -806,12 +853,13 @@ class EEGDashboard(param.Parameterized):
         try:
             # Check if we have cached spectral power for this epoch
             if self.epoch_index not in self._spectral_power_cache:
-                print(f"[WARNING TOPO] No spectral power cache for epoch {self.epoch_index}, computing now...")
-                self._compute_epoch_spectral_power(epoch_data)
+                # Do not compute synchronously in redraw path.
+                self._schedule_spectral_power_compute(self.epoch_index, epoch_data)
+                return None
             
             power_df = self._spectral_power_cache.get(self.epoch_index)
             if power_df is None or len(power_df) == 0:
-                print(f"[WARNING TOPO] Empty spectral power cache for epoch {self.epoch_index}")
+                debug_print(f"[WARNING TOPO] Empty spectral power cache for epoch {self.epoch_index}")
                 return None
             
             # Extract power values for the selected time window
@@ -1031,7 +1079,7 @@ class EEGDashboard(param.Parameterized):
         y_min, y_max = y_range
         rect_data = []
         
-        # Initialize cache if epoch changed and generate topoplots for all regions upfront
+        # Initialize cache if epoch changed.
         if epoch_data is not None and MNE_AVAILABLE:
             # Clear cache if epoch changed
             if self._current_epoch_for_cache != self.epoch_index:
@@ -1042,17 +1090,6 @@ class EEGDashboard(param.Parameterized):
             # Cache structure for this epoch
             if self.epoch_index not in self._topoplot_cache:
                 self._topoplot_cache[self.epoch_index] = {}
-            
-            # Generate topoplots for all regions upfront (for hover tooltip)
-            for region_id, region in regions.items():
-                rel_start = region.get('relative_start', region['start_idx'])
-                rel_stop = region.get('relative_stop', region['stop_idx'])
-                
-                # Generate topoplot if not already cached
-                if region_id not in self._topoplot_cache[self.epoch_index]:
-                    topo_img = self._create_topoplot_image(region_id, epoch_data, rel_start, rel_stop)
-                    if topo_img:
-                        self._topoplot_cache[self.epoch_index][region_id] = topo_img
         
         for region_id, region in regions.items():
             # Get relative indices for display
@@ -1086,9 +1123,15 @@ class EEGDashboard(param.Parameterized):
             start_time = (rel_start / self.sampling_rate) + time_offset_seconds
             stop_time = (rel_stop / self.sampling_rate) + time_offset_seconds
             
-            # Get topoplot HTML from cache (now pre-generated)
+            # Get topoplot HTML from cache (lazy generation for selected region only).
             topo_html = ''
             if epoch_data is not None and MNE_AVAILABLE:
+                # Lazy compute only for selected region to keep redraw cheap.
+                if is_sel and (self.epoch_index in self._topoplot_cache and
+                               region_id not in self._topoplot_cache[self.epoch_index]):
+                    topo_img = self._create_topoplot_image(region_id, epoch_data, rel_start, rel_stop)
+                    if topo_img:
+                        self._topoplot_cache[self.epoch_index][region_id] = topo_img
                 if (self.epoch_index in self._topoplot_cache and 
                     region_id in self._topoplot_cache[self.epoch_index]):
                     topo_img = self._topoplot_cache[self.epoch_index][region_id]
@@ -1129,7 +1172,7 @@ class EEGDashboard(param.Parameterized):
                 self._hover_epoch_data = {}
             self._hover_epoch_data[self.epoch_index] = epoch_data
         
-        print(f"[HOVER DEBUG] _create_selected_regions: Creating {len(df_rects)} rectangles for hover tool hook")
+        debug_print(f"[HOVER DEBUG] _create_selected_regions: Creating {len(df_rects)} rectangles for hover tool hook")
         
         # Note: HoverTool will be created/configured by the _configure_hover_tool_hook
         # Note: clone=False ensures each Rectangles element is unique (not cached by HoloViews)
@@ -1441,7 +1484,7 @@ class EEGDashboard(param.Parameterized):
         
         if total_time > 50 or True:  # Always log for debugging
             click_info = f", time_since_click={time_since_click:.1f}ms" if time_since_click is not None else ""
-            print(f"⏱️ create_main_plot START: cache_check={((t1-t0)*1000):.1f}ms, get_epoch_data={((t2-t1)*1000):.1f}ms, curves={((t3-t2)*1000):.1f}ms, regions={((t4-t3)*1000):.1f}ms, overlay={((t5-t4)*1000):.1f}ms, TOTAL={total_time:.1f}ms{click_info}")
+            debug_print(f"⏱️ create_main_plot START: cache_check={((t1-t0)*1000):.1f}ms, get_epoch_data={((t2-t1)*1000):.1f}ms, curves={((t3-t2)*1000):.1f}ms, regions={((t4-t3)*1000):.1f}ms, overlay={((t5-t4)*1000):.1f}ms, TOTAL={total_time:.1f}ms{click_info}")
         
         # Store plot creation time for tracking
         if not hasattr(self, '_plot_creation_times'):
@@ -2096,7 +2139,7 @@ class EEGDashboard(param.Parameterized):
         t5 = time_module.time()
         total_time = (t5 - t0) * 1000
         if total_time > 50:
-            print(f"⏱️ create_focus_channels_plot: get_epoch_data={((t1-t0)*1000):.1f}ms, curves={((t2-t1)*1000):.1f}ms, regions={((t3-t2)*1000):.1f}ms, overlay={((t4-t3)*1000):.1f}ms, opts={((t5-t4)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
+            debug_print(f"⏱️ create_focus_channels_plot: get_epoch_data={((t1-t0)*1000):.1f}ms, curves={((t2-t1)*1000):.1f}ms, regions={((t3-t2)*1000):.1f}ms, overlay={((t4-t3)*1000):.1f}ms, opts={((t5-t4)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
         
         return combined.opts(plot_opts)
 
@@ -2114,7 +2157,7 @@ class EEGDashboard(param.Parameterized):
             cached_plot = self._cached_focus_plots[channel_idx]
             t1 = time_module.time()
             if (t1 - t0) * 1000 > 1:  # Only log if cache check took time
-                print(f"⏱️ create_focus_plot Ch{channel_idx}: CACHED ({(t1-t0)*1000:.1f}ms)")
+                debug_print(f"⏱️ create_focus_plot Ch{channel_idx}: CACHED ({(t1-t0)*1000:.1f}ms)")
             return cached_plot
         
         epoch_data, current_regions, _ = self._get_epoch_data()
@@ -2156,7 +2199,7 @@ class EEGDashboard(param.Parameterized):
         
         total_time = (t3 - t0) * 1000
         if total_time > 50 or True:  # Always log for debugging
-            print(f"⏱️ create_focus_plot Ch{channel_idx}: get_epoch_data={((t1-t0)*1000):.1f}ms, plot_creation={((t2-t1)*1000):.1f}ms, opts={((t3-t2)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
+            debug_print(f"⏱️ create_focus_plot Ch{channel_idx}: get_epoch_data={((t1-t0)*1000):.1f}ms, plot_creation={((t2-t1)*1000):.1f}ms, opts={((t3-t2)*1000):.1f}ms, TOTAL={total_time:.1f}ms")
         
         return result
 
