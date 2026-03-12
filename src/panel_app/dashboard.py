@@ -56,11 +56,11 @@ ANNOTATION_COLORS = {
 # === CHANGE CONTEXT DISPLAY SETTINGS ===
 # Display settings: show extra context around each epoch
 # Epoch progression/hop remains controlled by EpochManager.epoch_length_sec (e.g. 20s).
-DISPLAY_CONTEXT_BEFORE_SEC = 5.0   # Seconds of context shown before epoch
-DISPLAY_CONTEXT_AFTER_SEC = 5.0    # Seconds of context shown after epoch
+DISPLAY_CONTEXT_BEFORE_SEC = 2.0   # Seconds of context shown before epoch
+DISPLAY_CONTEXT_AFTER_SEC = 2.0    # Seconds of context shown after epoch
 CONTEXT_BACKGROUND_COLOR = '#cfe8ff'  # Light blue - background color for context regions
 
-def downsample_minmax(data: np.ndarray, time: np.ndarray, max_points: int = 4000) -> tuple:
+def downsample_minmax(data: np.ndarray, time: np.ndarray, max_points: int = 2000) -> tuple:
     n = len(data)
     if n <= max_points: return time, data
     step = max(1, n // (max_points // 2))
@@ -1123,16 +1123,10 @@ class EEGDashboard(param.Parameterized):
             start_time = (rel_start / self.sampling_rate) + time_offset_seconds
             stop_time = (rel_stop / self.sampling_rate) + time_offset_seconds
             
-            # Get topoplot HTML from cache (lazy generation for selected region only).
+            # Get topoplot HTML from cache only (never generate synchronously in redraw path).
             topo_html = ''
             if epoch_data is not None and MNE_AVAILABLE:
-                # Lazy compute only for selected region to keep redraw cheap.
-                if is_sel and (self.epoch_index in self._topoplot_cache and
-                               region_id not in self._topoplot_cache[self.epoch_index]):
-                    topo_img = self._create_topoplot_image(region_id, epoch_data, rel_start, rel_stop)
-                    if topo_img:
-                        self._topoplot_cache[self.epoch_index][region_id] = topo_img
-                if (self.epoch_index in self._topoplot_cache and 
+                if (self.epoch_index in self._topoplot_cache and
                     region_id in self._topoplot_cache[self.epoch_index]):
                     topo_img = self._topoplot_cache[self.epoch_index][region_id]
                     topo_html = f'<img src="{topo_img}" style="width: 200px; height: 200px; margin-top: 5px; display: block;">'
