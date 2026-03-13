@@ -239,6 +239,16 @@ class EEGDashboard(param.Parameterized):
         self._main_ref_line_sources = []
         self._focus_ref_line_sources = []
 
+        # Fixed topoplot HTML pane (avoids "Models must be owned by only a single document")
+        self._topoplot_html_pane = pn.pane.HTML(
+            "<div style='width:200px;height:200px;display:flex;align-items:center;justify-content:center;"
+            "color:#aaa;font-size:11px;border:1px dashed #ddd;border-radius:4px;'>Select a region</div>",
+            width=200, height=200
+        )
+
+        # Bokeh document reference for thread-safe callbacks (set in view())
+        self._bokeh_doc = None
+
         # Now call super, which might trigger watchers immediately
         super().__init__(**params)
 
@@ -377,10 +387,9 @@ class EEGDashboard(param.Parameterized):
         )
         fig.add_tools(hover)
 
-        # BoxSelectTool — attach to first line renderer only
-        from bokeh.models.glyphs import Line as BokehLine
-        line_renderers = [r for r in fig.renderers if hasattr(r, 'glyph') and isinstance(r.glyph, BokehLine)]
-        box_select = BoxSelectTool(renderers=line_renderers[:1] if line_renderers else [])
+        # BoxSelectTool: renderers=[] so hit-test doesn't clamp the visual overlay,
+        # SelectionGeometry event still fires for our custom handler.
+        box_select = BoxSelectTool(renderers=[])
         fig.add_tools(box_select)
         fig.toolbar.active_drag = box_select
 
@@ -481,10 +490,9 @@ class EEGDashboard(param.Parameterized):
         )
         fig.add_tools(hover)
 
-        # BoxSelectTool
-        from bokeh.models.glyphs import Line as BokehLine
-        line_renderers = [r for r in fig.renderers if hasattr(r, 'glyph') and isinstance(r.glyph, BokehLine)]
-        box_select = BoxSelectTool(renderers=line_renderers[:1] if line_renderers else [])
+        # BoxSelectTool: renderers=[] so hit-test doesn't clamp the visual overlay,
+        # SelectionGeometry event still fires for our custom handler.
+        box_select = BoxSelectTool(renderers=[])
         fig.add_tools(box_select)
         fig.toolbar.active_drag = box_select
 
@@ -530,6 +538,18 @@ class EEGDashboard(param.Parameterized):
     # ------------------------------------------------------------------ #
     #  Data helpers
     # ------------------------------------------------------------------ #
+    def _run_on_doc_thread(self, fn):
+        """
+        Run fn() safely on the Bokeh document thread.
+        If a document reference is stored, schedules via add_next_tick_callback.
+        Otherwise calls fn() directly (safe during init before serving).
+        """
+        doc = self._bokeh_doc
+        if doc is not None:
+            doc.add_next_tick_callback(fn)
+        else:
+            fn()
+
     def _debounced_update(self, delay=0.01):
         """Debounced update trigger to prevent rapid-fire plot recreations."""
         if self._update_timer is not None:
@@ -538,8 +558,8 @@ class EEGDashboard(param.Parameterized):
 
         def do_update():
             if self._pending_update:
-                self.update_trigger += 1
                 self._pending_update = False
+                self._run_on_doc_thread(lambda: setattr(self, 'update_trigger', self.update_trigger + 1))
             self._update_timer = None
 
         self._update_timer = threading.Timer(delay, do_update)
@@ -552,7 +572,7 @@ class EEGDashboard(param.Parameterized):
             self._topoplot_timer.cancel()
 
         def do_update():
-            self.topoplot_trigger += 1
+            self._run_on_doc_thread(lambda: setattr(self, 'topoplot_trigger', self.topoplot_trigger + 1))
 
         self._topoplot_timer = threading.Timer(0.3, do_update)
         self._topoplot_timer.daemon = True
@@ -612,7 +632,9 @@ class EEGDashboard(param.Parameterized):
                 with self._spectral_power_lock:
                     self._spectral_power_in_progress.discard(epoch_index)
                 if self.epoch_index == epoch_index:
-                    self.topoplot_trigger += 1
+                    self._run_on_doc_thread(
+                        lambda: setattr(self, 'topoplot_trigger', self.topoplot_trigger + 1)
+                    )
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -1412,33 +1434,41 @@ class EEGDashboard(param.Parameterized):
 
         return ''
 
-    @param.depends('topoplot_trigger')
-    def topoplot_panel(self):
-        """Reactive panel for displaying topoplot of selected region."""
+    @param.depends('topoplot_trigger', 'selected_region_id', watch=True)
+    def _refresh_topoplot_panel(self):
+        """Update the fixed topoplot HTML pane in-place (avoids Bokeh document ownership errors)."""
         if self.selected_region_id == -1:
-            return pn.Spacer(width=200, height=200)
+            self._topoplot_html_pane.object = ""
+            return
 
         epoch_data, current_regions, _ = self._get_epoch_data()
 
         if not current_regions or self.selected_region_id not in current_regions:
-             return pn.Spacer(width=200, height=200)
+            self._topoplot_html_pane.object = ""
+            return
 
         region = current_regions[self.selected_region_id]
         rel_start = region.get('relative_start', region['start_idx'])
         rel_stop = region.get('relative_stop', region['stop_idx'])
 
         html = self._get_topoplot_on_demand(self.selected_region_id, epoch_data, rel_start, rel_stop)
+        self._topoplot_html_pane.object = html if html else "<span style='font-size:12px;color:gray;'>Topoplot unavailable</span>"
 
-        if not html:
-             return pn.pane.Markdown("Topoplot unavailable", styles={'font-size': '12px', 'color': 'gray'})
-
-        return pn.pane.HTML(html, width=200, height=200)
+        # Also refresh hover tooltip HTML in rect sources now that topo is cached
+        if html:
+            self._update_rect_data()
 
     # ------------------------------------------------------------------ #
     #  Dashboard layout (Bokeh-native: pn.pane.Bokeh instead of DynamicMap)
     # ------------------------------------------------------------------ #
     def view(self) -> pn.Column:
         """Create the dashboard view."""
+        # Capture Bokeh document for thread-safe callbacks from background threads
+        try:
+            self._bokeh_doc = pn.state.curdoc()
+        except Exception:
+            pass
+
         btn_prev = pn.widgets.Button(name='◀ Prev', width=80)
         btn_next = pn.widgets.Button(name='Next ▶', width=80)
         btn_prev.on_click(lambda e: setattr(self, 'epoch_index', max(0, self.epoch_index - 1)))
@@ -1486,27 +1516,36 @@ class EEGDashboard(param.Parameterized):
         .bk-btn-group .bk-btn:nth-child(2) { background-color: #95a5a6 !important; color: white !important; }
         </style>""")
 
-        controls_row = pn.Row(
-            btn_prev, btn_next,
-            pn.Spacer(width=10),
-            epoch_jump_input,
-            pn.Spacer(width=10),
-            info,
-            pn.Spacer(width=10),
-            radio_group,
-            pn.Spacer(width=10),
-            overlay_toggle,
-            pn.Spacer(width=10),
-            pn.pane.Markdown("**Keys:** `K`/`C` = KC, `U`/`Y` = unannotated, `D` = delete | **Drag to select** | **Hover for topoplot**",
-                           styles={'font-size': '11px', 'margin': '0px'}),
-            align='center',
+        controls_col = pn.Column(
+            pn.Row(
+                btn_prev, btn_next,
+                pn.Spacer(width=10),
+                epoch_jump_input,
+                pn.Spacer(width=10),
+                info,
+                pn.Spacer(width=10),
+                radio_group,
+                pn.Spacer(width=10),
+                overlay_toggle,
+                align='center',
+                sizing_mode='stretch_width',
+            ),
+            pn.pane.Markdown(
+                "**Keys:** `K`/`C` = KC | `U`/`Y` = unannotated | `D` = delete | **Drag** to select",
+                styles={'font-size': '11px', 'margin': '2px 0 0 0'}
+            ),
             sizing_mode='stretch_width',
-            margin=(5, 0)
+            margin=(5, 0),
         )
 
-        bottom_row = pn.Row(
-            self.topoplot_panel,
-            sizing_mode='stretch_width'
+        # Topoplot in top-right, beside controls
+        top_row = pn.Row(
+            controls_col,
+            pn.Spacer(width=10),
+            self._topoplot_html_pane,
+            align='start',
+            sizing_mode='stretch_width',
+            margin=(0, 0),
         )
 
         # Use pn.pane.Bokeh for direct Bokeh figures — NO DynamicMap rebuild overhead
@@ -1515,10 +1554,9 @@ class EEGDashboard(param.Parameterized):
 
         return pn.Column(
             self.status_bar,
-            controls_row,
+            top_row,
             focus_pane,
             main_pane,
-            bottom_row,
             self.kb_listener,
             style,
             sizing_mode='stretch_width',
