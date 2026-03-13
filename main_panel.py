@@ -341,6 +341,7 @@ Examples:
         main=[dashboard],
         accent_base_color="#3498db",
         header_background="#2c3e50",
+        theme_toggle=False,
     )
     
     print(f"\n{'='*60}")

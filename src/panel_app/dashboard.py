@@ -327,8 +327,8 @@ class EEGDashboard(param.Parameterized):
         fig = bk_figure(
             height=self.plot_height,
             sizing_mode='stretch_width',
-            tools='xwheel_zoom,xpan,reset',
-            active_scroll='xwheel_zoom',
+            tools='reset',
+            active_scroll=None,
             y_range=Range1d(y_min, y_max, bounds=(y_min, y_max)),
             x_range=Range1d(0, 1),
             output_backend='webgl',
@@ -419,8 +419,8 @@ class EEGDashboard(param.Parameterized):
         fig = bk_figure(
             height=focus_height,
             sizing_mode='stretch_width',
-            tools='xwheel_zoom,xpan,reset',
-            active_scroll='xwheel_zoom',
+            tools='reset',
+            active_scroll=None,
             y_range=Range1d(y_min, y_max, bounds=(y_min, y_max)),
             x_range=Range1d(0, 1),
             output_backend='webgl',
@@ -1561,8 +1561,8 @@ class EEGDashboard(param.Parameterized):
         # Topoplot in top-right, beside controls
         top_row = pn.Row(
             controls_col,
-            pn.Spacer(width=10),
-            self._topoplot_html_pane,
+            #pn.Spacer(width=10),
+            #self._topoplot_html_pane,
             align='start',
             sizing_mode='stretch_width',
             margin=(0, 0),
