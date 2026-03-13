@@ -127,6 +127,9 @@ class KeyboardListener(pn.reactive.ReactiveHTML):
             // Remove previous listener if exists
             if (window.kb_handler) document.removeEventListener('keydown', window.kb_handler);
 
+            // Monotonic counter forces a param change even for repeated same key presses
+            window._kb_seq = window._kb_seq || 0;
+
             // Define new handler
             window.kb_handler = (e) => {
                 // Ignore if user is typing in a real text input
@@ -135,7 +138,8 @@ class KeyboardListener(pn.reactive.ReactiveHTML):
                 let k = e.key.toLowerCase();
                 // Sync specific keys to Python (KC: k/c, unannotated: u/y, delete: d/delete)
                 if (['k', 'c', 'u', 'y', 'd', 'delete'].includes(k)) {
-                    data.key = k;
+                    window._kb_seq += 1;
+                    data.key = k + ':' + window._kb_seq;
                 }
             };
 
@@ -541,14 +545,25 @@ class EEGDashboard(param.Parameterized):
     def _run_on_doc_thread(self, fn):
         """
         Run fn() safely on the Bokeh document thread.
-        If a document reference is stored, schedules via add_next_tick_callback.
-        Otherwise calls fn() directly (safe during init before serving).
+        Schedules via add_next_tick_callback when a document is available,
+        otherwise calls fn() directly (safe during init before serving).
         """
         doc = self._bokeh_doc
+        if doc is None:
+            # Auto-discover document from a ColumnDataSource that's already in the doc.
+            # This covers the case where view() ran before the client connected
+            # (pn.state.curdoc() was None at that point).
+            for src in (self._main_rect_source, self._main_context_source,
+                        self._focus_rect_source):
+                d = getattr(src, 'document', None)
+                if d is not None:
+                    self._bokeh_doc = d
+                    doc = d
+                    break
         if doc is not None:
             doc.add_next_tick_callback(fn)
         else:
-            fn()
+            fn()  # No document yet (e.g. unit tests / pre-serve init)
 
     def _debounced_update(self, delay=0.01):
         """Debounced update trigger to prevent rapid-fire plot recreations."""
@@ -1118,7 +1133,11 @@ class EEGDashboard(param.Parameterized):
     # ------------------------------------------------------------------ #
     def _handle_kb_event(self, event):
         """Handle keyboard input from the ReactiveHTML component."""
-        key = event.new
+        raw = event.new
+        if not raw:
+            return
+        # Strip monotonic counter suffix (e.g. 'c:42' → 'c')
+        key = raw.split(':')[0] if ':' in raw else raw
         if not key or self.selected_region_id == -1:
             return
 
@@ -1454,9 +1473,10 @@ class EEGDashboard(param.Parameterized):
         html = self._get_topoplot_on_demand(self.selected_region_id, epoch_data, rel_start, rel_stop)
         self._topoplot_html_pane.object = html if html else "<span style='font-size:12px;color:gray;'>Topoplot unavailable</span>"
 
-        # Also refresh hover tooltip HTML in rect sources now that topo is cached
+        # Also refresh hover tooltip HTML in rect sources now that topo is cached.
+        # Schedule through _run_on_doc_thread so it always runs with the document lock.
         if html:
-            self._update_rect_data()
+            self._run_on_doc_thread(self._update_rect_data)
 
     # ------------------------------------------------------------------ #
     #  Dashboard layout (Bokeh-native: pn.pane.Bokeh instead of DynamicMap)
