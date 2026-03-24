@@ -19,7 +19,7 @@ open a new terminal -> terminal: new terminal
 **1. Create and activate a virtual environment**
 ```bash
 python -m venv kcannot
-kcannot\Scripts\activate.bat
+kcannot\Scripts\Activate.ps1
 ```
 
 **2. Upgrade pip**
