@@ -9,10 +9,20 @@ matplotlib>=3.7.0
 # EEG processing
 mne>=1.0.0
 
+# Machine learning (for future KC detection)
+#scikit-learn>=1.0.0
+
+# Original Dash implementation (optional, for backwards compatibility)
+#plotly>=5.0.0
+#dash>=2.0.0
+
 # Panel + HoloViews implementation (recommended)
 panel>=1.2.0
-holoviews>=1.18.0
-bokeh>=3.3.0
-datashader>=0.16.0
+holoviews>=1.17.0
+bokeh>=3.1.0
+datashader>=0.15.0
 colorcet>=3.0.0
 param>=2.0.0
+
+# Build tools (for creating standalone EXE)
+pyinstaller>=6.0.0
