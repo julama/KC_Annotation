@@ -53,7 +53,7 @@ python main.py --mat-file path/to/file.mat --sw-csv path/to/sw_events.csv
 
 - `--mat-file`: Path to .mat file containing EEG data (required, or will prompt for file selection)
 - `--sw-csv`: Path to CSV file with SW events (columns: `start_idx`, `stop_idx`)
-- `--annotation-file`: Output file for annotations (default: `annotations.csv`)
+- `--annotation-file`: Annotation CSV path (default: `<mat_stem>_annotations.csv` next to the loaded `.mat`, so each recording keeps its own file)
 - `--sleep-stages`: Sleep stages to analyze (default: `1 0 -1 -2 -3`)
 - `--channels`: Channel indices to display individually (default: `34 55 70`)
 - `--reference`: Re-referencing method: `average`, `common`, or `none` (default: none)

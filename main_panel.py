@@ -167,6 +167,15 @@ def is_frozen():
     return getattr(sys, 'frozen', False)
 
 
+def default_annotation_path_for_mat(mat_file: Path) -> Path:
+    """
+    Default annotation CSV beside the .mat file, derived from the MAT filename stem
+    so annotations from different recordings are never mixed (e.g. EPISL_01_W1...mat ->
+    EPISL_01_W1_..._annotations.csv).
+    """
+    return mat_file.parent / f"{mat_file.stem}_annotations.csv"
+
+
 def main():
     """Main function to launch the Panel annotation tool."""
     # Get base path for resource loading
@@ -192,8 +201,16 @@ Examples:
         """
     )
     parser.add_argument('--mat-file', type=str, help='Path to .mat file')
-    parser.add_argument('--annotation-file', type=str, default='annotations.csv',
-                       help='Path to annotation output file (default: annotations.csv)')
+    parser.add_argument(
+        '--annotation-file',
+        type=str,
+        default=None,
+        help=(
+            'Annotation CSV path. Default: <mat_stem>_annotations.csv in the same folder as the .mat '
+            '(e.g. EPISL_01_W1_EEG_....mat -> EPISL_01_W1_EEG_..._annotations.csv). '
+            'Relative paths are resolved next to the .mat file.'
+        ),
+    )
     parser.add_argument('--sleep-stages', type=int, nargs='+',
                        default=config.DEFAULT_SLEEP_STAGES,
                        help=f'Sleep stages to analyze (default: {config.DEFAULT_SLEEP_STAGES})')
@@ -298,11 +315,14 @@ Examples:
     )
     
     # Create annotation manager (no longer needs SW events)
-    annotation_file = args.annotation_file
-    if not Path(annotation_file).is_absolute():
-        # Save in same directory as .mat file
-        annotation_file = str(mat_file.parent / annotation_file)
-    
+    if args.annotation_file is None:
+        annotation_path = default_annotation_path_for_mat(mat_file)
+    else:
+        annotation_path = Path(args.annotation_file)
+        if not annotation_path.is_absolute():
+            annotation_path = mat_file.parent / annotation_path
+    annotation_file = str(annotation_path)
+
     print(f"\nInitializing annotation manager (output: {annotation_file})...")
     annotation_manager = AnnotationManager(annotation_file, epoch_manager.sampling_rate)
     
