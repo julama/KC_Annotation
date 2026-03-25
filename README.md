@@ -36,7 +36,7 @@ pip install -r requirements.txt
 
 Each time you return to the project, activate the environment first:
 ```bash
-kcannot\Scripts\activate.bat
+kcannot\Scripts\Activate.ps1
 # to start the app point to the mat file you want to load. E.g.
 python main_panel.py --mat-file  C:\Users\extamackerj\Julian\SW_detection_v01\data_EPISL\EPISL_01_W1\EPISL_01_W1\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
 ```
