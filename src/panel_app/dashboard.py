@@ -114,6 +114,53 @@ def load_channel_colors(channels_file: str) -> Dict[int, Tuple[float, float, flo
 
     return channel_colors
 
+
+def chanlocs_to_topomap_positions(chanlocs: pd.DataFrame, n_chans: int) -> np.ndarray:
+    """
+    Build (n, 2) positions for MNE plot_topomap from EEGLAB-style chanlocs.
+
+    MATLAB v7.3 + mat73 often yields object cells (scalars wrapped as 0-d arrays, etc.).
+    If those flow into a numpy array as dtype=object, np.sqrt and MNE can fail on Windows
+    with: loop of ufunc does not support ... sqrt ...
+    """
+    def _series_to_float64(series: pd.Series) -> np.ndarray:
+        out = np.empty(len(series), dtype=np.float64)
+        for i, item in enumerate(series.values):
+            a = np.asarray(item, dtype=object).squeeze()
+            if a is None or (isinstance(a, np.ndarray) and a.size == 0):
+                out[i] = np.nan
+            else:
+                try:
+                    out[i] = float(np.asarray(a).ravel()[0])
+                except (TypeError, ValueError):
+                    out[i] = np.nan
+        return out
+
+    if chanlocs is None or chanlocs.empty:
+        angles = np.linspace(0, 2 * np.pi, max(1, n_chans), endpoint=False)
+        return np.column_stack([np.cos(angles), np.sin(angles)])
+
+    if "X" in chanlocs.columns and "Y" in chanlocs.columns:
+        x = _series_to_float64(chanlocs["X"])
+        y = _series_to_float64(chanlocs["Y"])
+    elif "x" in chanlocs.columns and "y" in chanlocs.columns:
+        x = _series_to_float64(chanlocs["x"])
+        y = _series_to_float64(chanlocs["y"])
+    else:
+        angles = np.linspace(0, 2 * np.pi, max(1, n_chans), endpoint=False)
+        return np.column_stack([np.cos(angles), np.sin(angles)])
+
+    # Match prior dashboard convention: 2D layout from X/Y (EEGLAB head plot)
+    pos = np.column_stack([-y, x]).astype(np.float64, copy=False)
+
+    if pos.shape[0] > n_chans:
+        pos = pos[:n_chans].copy()
+    elif pos.shape[0] < n_chans:
+        angles = np.linspace(0, 2 * np.pi, max(1, n_chans), endpoint=False)
+        return np.column_stack([np.cos(angles), np.sin(angles)])
+    return pos
+
+
 # --- KEYBOARD LISTENER COMPONENT ---
 class KeyboardListener(pn.reactive.ReactiveHTML):
     """
@@ -1364,19 +1411,8 @@ class EEGDashboard(param.Parameterized):
             mean_power_linear = region_power.mean(axis=0).values
             mean_power_db = 10.0 * np.log10(np.maximum(mean_power_linear, 1e-12))
 
-            if not self.chanlocs.empty:
-                if 'X' in self.chanlocs.columns and 'Y' in self.chanlocs.columns:
-                    pos = np.array([-self.chanlocs['Y'].values, self.chanlocs['X'].values]).T
-                elif 'x' in self.chanlocs.columns and 'y' in self.chanlocs.columns:
-                    pos = np.array([-self.chanlocs['y'].values, self.chanlocs['x'].values]).T
-                else:
-                    n_chans = len(mean_power_db)
-                    angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
-                    pos = np.array([np.cos(angles), np.sin(angles)]).T
-            else:
-                n_chans = len(mean_power_db)
-                angles = np.linspace(0, 2*np.pi, n_chans, endpoint=False)
-                pos = np.array([np.cos(angles), np.sin(angles)]).T
+            n_chans = len(mean_power_db)
+            pos = chanlocs_to_topomap_positions(self.chanlocs, n_chans)
 
             pos_original = pos.copy()
             max_radius = np.max(np.sqrt(pos[:, 0]**2 + pos[:, 1]**2))
