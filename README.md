@@ -58,7 +58,7 @@ Whenever you come back to the project, activate the venv, then pass the path to 
 ```powershell
 .\kcannot\Scripts\Activate.ps1
 
-python main_panel.py --mat-file  "C:\yourPath\Data\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat" -> replace with correct path
+python main_panel.py --mat-file  "C:\yourPath\Data\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat" -> replace with correct path
 ```
 
 After a few seconds, the app should open in your browser.
