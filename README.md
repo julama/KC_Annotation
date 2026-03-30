@@ -43,10 +43,10 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-#### 6. Copy your `.mat` into the project `Data` folder
+#### 6. Copy your `.mat` into the project `Data` folder, e.g.
 
 ```text
-L:\Somnus-Data\Data01\EPISL\Data\Healthy_adults\Preprocessed\EEG\EPISL_01_W1\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
+C:\yourPath\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
 ```
 
 Copy the file into `KC_Annotation\Data\` next to `channels.csv`.
@@ -58,7 +58,7 @@ Whenever you come back to the project, activate the venv, then pass the path to 
 ```powershell
 .\kcannot\Scripts\Activate.ps1
 
-python main_panel.py --mat-file  "C:\Users\extamackerj\Julian\SW_detection_v01\data_EPISL\EPISL_01_W1\EPISL_01_W1\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat" -> replace with correct path
+python main_panel.py --mat-file  "C:\yourPath\Data\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat" -> replace with correct path
 ```
 
 After a few seconds, the app should open in your browser.
