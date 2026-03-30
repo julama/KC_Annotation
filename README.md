@@ -1,45 +1,69 @@
 # EEG K-Complex Annotation Tool
 
-A Plotly Dash-based GUI application for annotating K-complexes in EEG data.
+Panel-based GUI (HoloViews / Panel) for annotating K-complexes in EEG data.
 
-## Installation
+---
 
-1. Install dependencies:
 ## Installation
 
 ### Prerequisites
-- Python 3.11 ([Microsoft Store](https://apps.microsoft.com/detail/9nrwmjp3717k))
 
+- [Visual Studio Code](https://code.visualstudio.com/) (recommended)
 ### Steps
-**0. Open the project in VSCode
-'''
-open a new terminal -> terminal: new terminal
-'''
 
-**1. Create and activate a virtual environment**
-```bash
+#### 1. Clone the repository in VS Code
+
+1. Open the **Source Control** view (branch icon in the sidebar).
+2. Click **Clone Repository**.
+3. Paste: `https://github.com/julama/KC_Annotation`
+4. Choose a **local folder** (prefer a normal project drive; very large synced volumes can be slow).
+
+Open the cloned `KC_Annotation` folder in VS Code.
+
+#### 2. Open a terminal
+
+**Terminal → New Terminal**
+
+#### 3. Create and activate a virtual environment
+
+```terminal
 python -m venv kcannot
-kcannot\Scripts\Activate.ps1
+.\kcannot\Scripts\Activate.ps1
 ```
 
-**2. Upgrade pip**
-```bash
+#### 4. Upgrade pip
+
+```terminal
 python -m pip install --upgrade pip
 ```
 
-**3. Install dependencies**
-```bash
+#### 5. Install dependencies
+
+```terminal
 pip install -r requirements.txt
 ```
 
+#### 6. Copy your `.mat` into the project `Data` folder
+
+```text
+L:\Somnus-Data\Data01\EPISL\Data\Healthy_adults\Preprocessed\EEG\EPISL_01_W1\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
+```
+
+Copy the file into `KC_Annotation\Data\` next to `channels.csv`.
+
 ### Running the app
 
-Each time you return to the project, activate the environment first:
-```bash
-kcannot\Scripts\Activate.ps1
-# to start the app point to the mat file you want to load. E.g.
-python main_panel.py --mat-file  C:\Users\extamackerj\Julian\SW_detection_v01\data_EPISL\EPISL_01_W1\EPISL_01_W1\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat
+Whenever you come back to the project, activate the venv, then pass the path to your `.mat` file:
+
+```powershell
+.\kcannot\Scripts\Activate.ps1
+
+python main_panel.py --mat-file  "C:\Users\extamackerj\Julian\SW_detection_v01\data_EPISL\EPISL_01_W1\EPISL_01_W1\EPISL_01_W1_EEG_FiltDwn_05to30Hz.mat" -> replace with correct path
 ```
+
+After a few seconds, the app should open in your browser.
+
+---
 
 ## Usage
 

@@ -1,9 +1,45 @@
 """Load .mat files and extract EEG data, epochs, and channel information"""
 
+import logging
+from contextlib import contextmanager
+
 import scipy.io as sio
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Optional
+
+
+# mat73 logs ERROR for MATLAB objects it cannot decode (e.g. digitalFilter in EEGLAB structs).
+# The fields we need (data, srate, …) still load; suppress only this noisy message.
+_SUPPRESS_MAT73_SUBSTR = "MATLAB type not supported"
+
+
+class _SuppressMat73UnsupportedTypeFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return _SUPPRESS_MAT73_SUBSTR not in record.getMessage()
+        except Exception:
+            return True
+
+
+@contextmanager
+def _silence_mat73_unsupported_type_logs():
+    flt = _SuppressMat73UnsupportedTypeFilter()
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    last_resort = getattr(logging, "lastResort", None)
+    if last_resort is not None and last_resort not in handlers:
+        handlers.append(last_resort)
+    for h in handlers:
+        h.addFilter(flt)
+    try:
+        yield
+    finally:
+        for h in handlers:
+            try:
+                h.removeFilter(flt)
+            except ValueError:
+                pass
 
 
 class EEGData:
@@ -140,7 +176,8 @@ def load_mat_file(filepath: str) -> EEGData:
 
         import mat73  # reads MATLAB v7.3 MAT files
 
-        mat = mat73.loadmat(filepath)
+        with _silence_mat73_unsupported_type_logs():
+            mat = mat73.loadmat(filepath)
         eeg_struct = mat["EEG"]
 
         # mat73 sometimes wraps the EEG struct in a 1-element list
